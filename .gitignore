@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+
+# סביבת venv מקומית של הפרויקט + קובץ הסודות עם המפתחות עצמם (ANTHROPIC_API_KEY,
+# GOOGLE_API_KEY וכו') - לעולם לא נכנסים ל-git. .env.example כן נשאר ב-git כתבנית.
+.venv/
+.env
+
+# נתונים שנוצרים בזמן ריצה - מכילים PII (שם/כתובת/גיל) של פונים
+data/
+
+# תוצר בנייה נגזר (FAISS index + docstore) - נבנה מחדש אוטומטית מ-
+# training/distress_dataset_final.txt אם חסר/לא מעודכן, אין צורך ב-git
+training/faiss_index/
+
+# מודל HeBERT מאומן (~418MB, בעיקר model.safetensors) - הורדה/חילוץ מ-
+# hebert_distress_model.zip שנוצר ב-training/train_hebert_colab.ipynb, לא קוד.
+# קובץ בגודל הזה נכשל בפוש ל-GitHub (מגבלת 100MB לקובץ) - משוחזר מהאימון מחדש.
+hebert_distress_model/
+
+*.zip
+*.log

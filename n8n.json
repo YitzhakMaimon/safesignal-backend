@@ -1,0 +1,1276 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "safesignal/ingest/website",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -3408,
+        80
+      ],
+      "id": "webhook-website",
+      "name": "Website URL Input",
+      "webhookId": "8f35c43d-f3a4-47bd-a1fa-163198fe59d4"
+    },
+    {
+      "parameters": {
+        "url": "={{ ($json.body || $json).url }}",
+        "options": {
+          "allowUnauthorizedCerts": true,
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -3184,
+        80
+      ],
+      "id": "http-fetch-website",
+      "name": "Fetch Website Content"
+    },
+    {
+      "parameters": {
+        "jsCode": "// שולף טקסט גלוי + כתובת תמונה ראשונה + כתובת קובץ שמע ראשונה מתוך ה-HTML\n// הגולמי שנשלף בצומת הקודם, ומנתב כל סוג תוכן שנמצא (0-3 items) לאותו צומת\n// שהיה מטפל בו אילו הגיע ישירות דרך אחד משלושת מקורות הקלט האחרים. חיפוש\n// המצוקה עצמו קורה בהמשך הזרימה הקיימת (Input Screening ואילך) - לא כאן.\nconst trigger = $('Website URL Input').item.json;\nconst body = trigger.body || trigger;\nconst user_id = body.user_id || \"anonymous\";\nconst incident_id = body.incident_id || \"\";\n\nconst html = $json.data || $json.body || \"\";\nconst withoutScripts = html\n  .replace(/<script[\\s\\S]*?<\\/script>/gi, \"\")\n  .replace(/<style[\\s\\S]*?<\\/style>/gi, \"\");\n\nconst pageText = withoutScripts\n  .replace(/<[^>]+>/g, \" \")\n  .replace(/&nbsp;/g, \" \")\n  .replace(/\\s+/g, \" \")\n  .trim();\n\nconst imageMatch = withoutScripts.match(/<img[^>]+src=[\"']([^\"']+)[\"']/i);\nconst audioMatch = withoutScripts.match(\n  /<audio[^>]+src=[\"']([^\"']+)[\"']|href=[\"']([^\"']+\\.(?:mp3|wav|ogg|m4a))[\"']/i\n);\n\nconst items = [];\nif (pageText) {\n  items.push({ json: { _route: \"text\", text_content: pageText, user_id, incident_id } });\n}\nif (imageMatch) {\n  items.push({ json: { _route: \"image\", image_url: imageMatch[1], user_id, incident_id } });\n}\nif (audioMatch) {\n  items.push({ json: { _route: \"voice\", audio_url: audioMatch[1] || audioMatch[2], user_id, incident_id } });\n}\nreturn items;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2960,
+        80
+      ],
+      "id": "code-extract-website-content",
+      "name": "Extract Website Content"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 20
+            }
+          ]
+        }
+      },
+      "notes": "לשינוי תדירות הסריקה: לפתוח את הצומת הזה ולערוך את minutesInterval. n8n לא מאפשר לצומת טריגר לקרוא ערך דינמי מצומת אחר, ולכן זה חייב להיקבע כאן ולא ב-Telegram Poll Config.",
+      "notesInFlow": true,
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -3408,
+        320
+      ],
+      "id": "schedule-telegram-poll",
+      "name": "Telegram Poll Trigger"
+    },
+    {
+      "parameters": {
+        "jsCode": "// כאן קובעים בקלות מאיזו קבוצה/ערוץ בטלגרם למשוך וכמה הודעות בכל סריקה.\n// את תדירות הסריקה (כל כמה זמן) קובעים בצומת הקודם (Telegram Poll Trigger),\n// כי צמתי Trigger ב-n8n לא יכולים לקרוא ערך דינמי מצומת אחר - זו מגבלה של\n// n8n עצמו, לא בחירה שלנו.\nreturn [{\n  json: {\n    peer_id: \"2097208579\",\n    limit: 10\n  }\n}];\n"
+      },
+      "notes": "לשינוי כמות ההודעות שנמשכות או הקבוצה/ערוץ: לערוך peer_id ו-limit כאן.",
+      "notesInFlow": true,
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3184,
+        320
+      ],
+      "id": "code-telegram-poll-config",
+      "name": "Telegram Poll Config"
+    },
+    {
+      "parameters": {
+        "url": "=https://telegram155.p.rapidapi.com/v1/peers/{{ $json.peer_id }}/history",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "limit",
+              "value": "={{ $json.limit }}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-RapidAPI-Host",
+              "value": "telegram155.p.rapidapi.com"
+            }
+          ]
+        },
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "allowUnauthorizedCerts": true
+        }
+      },
+      "notes": "אישורים כבר מוגדרים (קרדנציאל 'RapidAPI Telegram155 Key' נוצר ב-n8n דרך ה-API, לא נשמר כאן ב-JSON). allowUnauthorizedCerts דרוש בגלל בעיית SSL של הרשת הארגונית - אותה בעיה שבגללה גם ל-Fetch Website Content יש את האופציה הזו.",
+      "notesInFlow": true,
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -2960,
+        320
+      ],
+      "id": "http-fetch-telegram-messages",
+      "name": "Fetch Telegram Messages",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "xYXwjoeJmb7G0nZK",
+          "name": "RapidAPI Telegram155 Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// לוקח את מערך messages שחזר מ-RapidAPI (Telegram155 getHistory) והופך כל הודעה\n// עם טקסט לפריט נפרד עם _route: \"text\", באותו פורמט שמצפה לו Route by Detected\n// Content (בדיוק כמו Extract Website Content). הודעות בלי טקסט (מדיה בלבד) מדולגות.\n//\n// RapidAPI מחזיר את ההודעות מהחדשה לישנה (msg.id/msg.date יורדים). הופכים\n// את הסדר (oldest-first) לפני היצירה, כדי שהשורות שנכתבות לאקסל המצטבר\n// יהיו בסדר כרונולוגי, במקום הפוך בכל באטש (2026-07-20 באג שהתגלה בבדיקה).\n// גם שולחים הלאה את msg.date (זמן שליחה אמיתי של ההודעה בטלגרם, unix\n// epoch) בתור telegram_message_date - כדי שהעמודה timestamp באקסל תשקף מתי\n// ההודעה נשלחה בפועל, לא מתי הריצה שלנו עיבדה אותה.\n//\n// לגבי תמונות/סרטונים: תגובת ה-API מכילה כרגע רק מבנה MTProto גולמי של המדיה\n// (media.photo / media.video עם file_reference/dcid) ולא קישור URL שניתן להוריד\n// ישירות - לכן עדיין לא מנתבים אותם ל-Image Analysis. מסמנים has_photo/has_video\n// לצורך נראות בלבד, עד שנברר מול RapidAPI endpoint ייעודי להורדת מדיה.\nconst config = $('Telegram Poll Config').item.json;\nconst peerId = config.peer_id;\n\nconst response = $json;\nconst messages = [...(response.messages || [])].reverse();\n\nconst items = [];\nfor (const msg of messages) {\n  const text = (msg.message || \"\").trim();\n  if (!text) continue; // הודעת מדיה בלבד, אין מה לנתח\n\n  const fromId = msg.from_id || {};\n  const senderUserId = fromId.user_id;\n  const userId = senderUserId ? `telegram:${senderUserId}` : \"anonymous\";\n\n  const media = msg.media || {};\n  const hasPhoto = Boolean(media.photo);\n  const hasVideo = Boolean(media.video) || Boolean(media.document && (media.document.mime_type || \"\").startsWith(\"video/\"));\n\n  items.push({\n    json: {\n      _route: \"text\",\n      text_content: text,\n      user_id: userId,\n      incident_id: `telegram-${peerId}-${msg.id}`,\n      telegram_message_id: msg.id,\n      telegram_message_date: msg.date,\n      telegram_peer_id: peerId,\n      has_photo: hasPhoto,\n      has_video: hasVideo\n    }\n  });\n}\n\nreturn items;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2736,
+        320
+      ],
+      "id": "code-extract-telegram-messages",
+      "name": "Extract Telegram Messages"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "rule-route-text",
+                    "leftValue": "={{ $json._route }}",
+                    "rightValue": "text",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "rule-route-image",
+                    "leftValue": "={{ $json._route }}",
+                    "rightValue": "image",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "rule-route-voice",
+                    "leftValue": "={{ $json._route }}",
+                    "rightValue": "voice",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        -2736,
+        64
+      ],
+      "id": "switch-route-website-content",
+      "name": "Route by Detected Content"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8000/api/v1/vision/textract-rekognition",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json; charset=utf-8"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ user_id: ($json.body || $json).user_id || \"anonymous\", incident_id: ($json.body || $json).incident_id || \"\", image_url: ($json.body || $json).image_url || \"\", source: \"image\" }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -2512,
+        80
+      ],
+      "id": "http-textract",
+      "name": "Image Analysis (Gemini Vision)"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8000/api/v1/audio/transcribe",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json; charset=utf-8"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ user_id: ($json.body || $json).user_id || \"anonymous\", incident_id: ($json.body || $json).incident_id || \"\", audio_url: ($json.body || $json).audio_url || \"\", source: \"voice\" }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -2512,
+        272
+      ],
+      "id": "http-transcribe",
+      "name": "Voice Transcription (Groq Whisper)"
+    },
+    {
+      "parameters": {
+        "numberInputs": 3
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        -2288,
+        -16
+      ],
+      "id": "merge-sources",
+      "name": "Merge Sources"
+    },
+    {
+      "parameters": {
+        "jsCode": "// מקבץ פריטים לפי incident_id לפני איחוד טקסט: פריטים שחולקים incident_id\n// (או שכולם בלי incident_id בכלל - למשל דף אינטרנט בודד עם טקסט+תמונה+קול\n// שמתארים את אותו אירוע) מתמזגים לרשומה אחת עם טקסט מאוחד, כמו קודם.\n// פריטים עם incident_id שונה זה מזה (למשל 20 הודעות טלגרם עצמאיות מסריקה\n// אחת, שלכל אחת כבר יש incident_id ייחודי משלה שנקבע ב-Extract Telegram\n// Messages) *לא* מתמזגים - כל אחד ממשיך כרשומה/אירוע נפרד משלו. בלי הקיבוץ\n// הזה, 20 הודעות עצמאיות היו נטבעות זו בזו לאירוע מדומה אחד (2026-07-20 בדיקה\n// שחשפה את זה).\n//\n// הבחירה איזה שדה טקסט לקחת מכל item נעשית לפי route/source שלו (לא לפי\n// סדר עדיפות גנרי על השדות) כי safesignal.py תמיד ממלא placeholder ל-\n// text_content בכל תגובה -- גם בתגובת התמלול -- כך שסדר עדיפות גנרי\n// (text_content || TranscriptionText) תמיד \"מנצח\" עם ה-placeholder ומפספס\n// את התמלול/הזיהוי האמיתיים.\nconst items = $input.all();\n\nconst groups = new Map(); // groupKey -> { texts: [], user_id, incident_id, message_timestamp }\n\nfor (const item of items) {\n  const raw = item.json.body || item.json;\n  const route = raw._route || raw.source || \"\";\n  const groupKey = raw.incident_id || \"\";\n\n  let t;\n  if (route === \"voice\") t = raw.TranscriptionText;\n  else if (route === \"image\") t = raw.DetectedText;\n  else t = raw.text_content || raw.DetectedText || raw.TranscriptionText || raw.text;\n  t = t || \"\";\n\n  if (!groups.has(groupKey)) {\n    groups.set(groupKey, { texts: [], user_id: \"anonymous\", incident_id: groupKey, message_timestamp: null });\n  }\n  const group = groups.get(groupKey);\n  if (t && !group.texts.includes(t)) group.texts.push(t);\n  if (raw.user_id && raw.user_id !== \"anonymous\") group.user_id = raw.user_id;\n  if (group.message_timestamp === null && raw.telegram_message_date) group.message_timestamp = raw.telegram_message_date;\n}\n\nreturn Array.from(groups.values()).map((group) => ({\n  json: {\n    text_content: group.texts.join(\"\\n\"),\n    user_id: group.user_id,\n    incident_id:\n      group.incident_id ||\n      (typeof crypto !== \"undefined\" && crypto.randomUUID\n        ? crypto.randomUUID()\n        : `incident-${Date.now()}`),\n    message_timestamp: group.message_timestamp,\n  },\n}));\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2064,
+        0
+      ],
+      "id": "code-unified-ingestion",
+      "name": "Unified Ingestion (Backend)"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8000/api/v1/ingest/raw-log",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json; charset=utf-8"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ user_id: $json.user_id, incident_id: $json.incident_id, text_content: $json.text_content, message_timestamp: $json.message_timestamp }) }}",
+        "options": {}
+      },
+      "notes": "2026-07-20: הוחלף מ-AWS S3 node (JSON נפרד לכל הודעה) לקריאה ל-safesignal.py, שכותב שורה אחת לקובץ Excel מצטבר יחיד ב-S3 (raw/raw_messages_log.xlsx) - אותו דפוס read-modify-write כמו incidents_table.xlsx.",
+      "notesInFlow": true,
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -1840,
+        0
+      ],
+      "id": "noop-upload-file",
+      "name": "Upload a file"
+    },
+    {
+      "parameters": {
+        "jsCode": "// בניגוד לצומת ה-AWS S3 הישן, safesignal.py כבר מחזיר בחזרה את\n// text_content/user_id/incident_id המקוריים (merged(body, ...)) + logged.\n// עדיין משחזרים במפורש מהפריט שיצא מ-Unified Ingestion (Backend) כדי לא\n// להסתמך על כך שה-endpoint ימשיך תמיד להדהד את כל השדות באותה צורה.\n//\n// צומת Code רץ פעם אחת על כל ה-items (run once for all items), אז חייבים\n// לעבור על כולם עם $input.all() ולהחזיר item אחד לכל item נכנס. הגרסה\n// הקודמת החזירה [{ json: ... }] קשיח - item יחיד בלבד - ולכן מתוך 19-20\n// הודעות טלגרם שנכנסו, רק 1 יצאה והמשיכה לסיווג/Decision Agent, וה-19\n// האחרות נבלעו בשקט (2026-07-20 באג שהתגלה כי המשתמש ביקש לוודא שכל\n// ההודעות ממשיכות לצמתי ההחלטה).\nconst uploadResults = $input.all();\nconst originals = $('Unified Ingestion (Backend)').all();\nreturn uploadResults.map((uploadResult, i) => ({\n  json: { ...originals[i].json, raw_log: uploadResult.json },\n}));\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1616,
+        0
+      ],
+      "id": "code-restore-ingestion-data",
+      "name": "Restore Ingestion Data"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8000/api/v1/screening/input",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json; charset=utf-8"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -1392,
+        0
+      ],
+      "id": "http-input-screening",
+      "name": "Text Analysis (HeBERT + Comprehend)"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-passed-input-screening",
+              "leftValue": "={{ $json.passed }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -1168,
+        0
+      ],
+      "id": "if-passed-input-screening",
+      "name": "Passed Input Screening?"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        624,
+        288
+      ],
+      "id": "noop-reject",
+      "name": "Reject"
+    },
+    {
+      "parameters": {
+        "text": "={{ $json.text_content }}",
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"names\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}, \"description\": \"Full or partial person names explicitly mentioned. Do NOT include gender/age descriptor words such as Hebrew 'בן'/'בת' (as in 'אני בת 17') as names.\"},\n    \"addresses\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}, \"description\": \"Street addresses, cities, or location identifiers explicitly mentioned.\"},\n    \"ages\": {\"type\": \"array\", \"items\": {\"type\": \"integer\"}, \"description\": \"Ages mentioned, as integers.\"},\n    \"phone_numbers\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}, \"description\": \"Phone numbers, Israeli or international format, exactly as they appear.\"}\n  },\n  \"required\": [\"names\", \"addresses\", \"ages\", \"phone_numbers\"]\n}",
+        "options": {
+          "systemPromptTemplate": "You are a strict, factual Named Entity Recognition (NER) locator for a crisis-response identification pipeline. You do NOT analyze mood, distress, urgency, or sentiment in any way -- that happens elsewhere. Your ONLY task: extract personal identifying information (PII) explicitly present in the text below (Hebrew or English) -- names, geographic addresses, ages, and phone numbers.\n\nRules:\n- Extract only facts explicitly stated. Never infer, guess, or invent.\n- Do not treat Hebrew gender/age descriptor words (\"בן\", \"בת\", and similar) as names.\n- If a category has nothing to extract, return an empty array for it -- never omit the key.\n- No conversational text, no explanations, no filler -- structured data only."
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.informationExtractor",
+      "typeVersion": 1.2,
+      "position": [
+        -944,
+        -96
+      ],
+      "id": "http-extract-info",
+      "name": "Relevant Information Extraction (Ollama)"
+    },
+    {
+      "parameters": {
+        "model": "llama3.1:latest",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+      "typeVersion": 1,
+      "position": [
+        -960,
+        112
+      ],
+      "id": "lm-ollama-chat-info-extraction",
+      "name": "Ollama Chat Model",
+      "credentials": {
+        "ollamaApi": {
+          "id": "fUiGEoi2VKZcRQX0",
+          "name": "Ollama - Local"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n-nodes-langchain.informationExtractor מחליף את $json בפלט שלו לכל item\n// ({ output: {...} } בלבד) - מאבד את text_content/user_id/incident_id/\n// screening_reason שהצמתים הבאים (Distress Classification, RAG, Decision\n// Agent) צריכים. משחזרים אותם מהפריטים שיצאו מ-Passed Input Screening?,\n// לפני החילוץ - אותו דפוס בדיוק כמו Restore Ingestion Data.\n//\n// קריטי: צומת Code רץ פעם אחת על כל ה-items (run once for all items) - חובה\n// לעבור על כולם עם $input.all() ולא רק על $json/.item (item ראשון בלבד).\n// הגרסה הקודמת עשתה בדיוק את הטעות הזו והחזירה item יחיד קשיח - מתוך באטש\n// טלגרם עם כמה הודעות שעברו סינון, רק הראשונה הייתה ממשיכה לסיווג מצוקה,\n// השאר נבלעות בשקט (2026-07-21 באג קריטי שהתגלה באותה סריקה שבה חשפנו את\n// אותו דפוס בדיוק ב-Output Screening/Routing Result - זה אותו באג, בקוד\n// שכתבתי היום בעצמי).\n//\n// גם אוכפים כאן, בקוד דטרמיניסטי (לא רק בהנחיית ה-LLM), את אותם חוקים\n// עסקיים שהיו ב-info_extraction.py המקורי: סינון מילות-יחס/גיל כ\"שם\"\n// (בן/בת/אני/וכו') ו-placeholder \"אין שם\" כשלא נמצא שם אמיתי - כדי שההחלפה\n// תהיה זהה בפועל, לא רק \"מבוקשת מהמודל\".\nconst NON_NAME_WORDS = new Set([\n  \"בן\", \"בת\", \"אני\", \"אתה\", \"את\", \"הוא\", \"היא\", \"אנחנו\", \"אתם\", \"אתן\", \"הם\", \"הן\",\n  \"ילד\", \"ילדה\", \"נער\", \"נערה\", \"מר\", \"גברת\", \"אדון\"\n]);\nconst NO_NAME_PLACEHOLDER = \"אין שם\";\n\nconst originals = $('Passed Input Screening?').all();\n\nreturn $input.all().map((item, i) => {\n  const original = originals[i].json;\n  const extracted = item.json.output || {};\n\n  const names = (Array.isArray(extracted.names) ? extracted.names : [])\n    .filter(n => typeof n === \"string\" && n.trim() && !NON_NAME_WORDS.has(n.trim()));\n\n  const ages = (Array.isArray(extracted.ages) ? extracted.ages : [])\n    .filter(a => Number.isInteger(a) || /^\\d+$/.test(String(a)))\n    .map(a => parseInt(a, 10));\n\n  return {\n    json: {\n      ...original,\n      names: names.length ? names : [NO_NAME_PLACEHOLDER],\n      addresses: Array.isArray(extracted.addresses) ? extracted.addresses : [],\n      ages,\n      phone_numbers: Array.isArray(extracted.phone_numbers) ? extracted.phone_numbers : [],\n    },\n  };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -720,
+        -96
+      ],
+      "id": "code-restore-extraction-context",
+      "name": "Restore Extraction Context"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.text_content }}",
+        "hasOutputParser": true,
+        "options": {
+          "systemMessage": "את/ה מסווג/ת מצוקה עבור מוקד תמיכה המטפל בפניות של בני נוער.\nההודעה שלפניך כבר עברה שלב סינון ראשוני אוטומטי שסימן אותה כחשודה כפנייה במצוקה -\nתפקידך כעת הוא לתת סיווג מדויק יותר, ולא לחזור על הסינון הראשוני.\n\nסווג/י את ההודעה (בעברית או באנגלית) לאחת מהקטגוריות הבאות בדיוק:\n\n- \"התאבדות/ארוע חירום\": סימנים ברורים לכוונה אובדנית או לסכנת חיים מיידית (למשל תכנון\n  לפגוע בעצמו/ה, פרידה/מכתב פרידה, \"לסיים עם הכל\"). להשתמש בקטגוריה זו רק כשיש רמז\n  מפורש בטקסט - לא להסיק מעבר למה שכתוב.\n- \"מצוקה רגשית\": ביטויי בדידות, ייאוש, עצב, חוסר אונים או מצוקה נפשית שאינם מגיעים\n  לרמת סיכון מיידי לחיים.\n- \"חרם\": הדרה חברתית, נידוי, בריונות חברתית (\"כולם מתעלמים ממני\", \"מחרימים אותי\").\n- \"רגיל\": לאחר קריאה מדוקדקת, אין בטקסט בפועל סימני מצוקה משמעותיים (כלומר הסינון\n  הראשוני היה כנראה false positive - למשל סרקזם, ביטוי סלנג לא מילולי, או הקשר תמים).\n\nהחזר/י אך ורק את קטגוריית המצוקה המתאימה ביותר (אחת מארבע הקטגוריות בדיוק, כפי שנכתבו\nלעיל) ומשפט קצר אחד בעברית המסביר את הסיווג. אין להסיק מידע שלא נאמר במפורש בטקסט."
+        }
+      },
+      "onError": "continueRegularOutput",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        -720,
+        -96
+      ],
+      "id": "http-classify-distress",
+      "name": "Distress Classification (Bedrock)"
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"class\": {\"type\": \"string\", \"enum\": [\"התאבדות/ארוע חירום\", \"מצוקה רגשית\", \"חרם\", \"רגיל\"]},\n    \"summary\": {\"type\": \"string\", \"description\": \"משפט אחד בעברית המסביר את הסיווג\"}\n  },\n  \"required\": [\"class\", \"summary\"]\n}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        -616,
+        112
+      ],
+      "id": "output-parser-classification",
+      "name": "Structured Output Parser"
+    },
+    {
+      "parameters": {
+        "modelSource": "inferenceProfile",
+        "model": "us.anthropic.claude-opus-4-6-v1",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatAwsBedrock",
+      "typeVersion": 1.1,
+      "position": [
+        -736,
+        112
+      ],
+      "id": "lm-bedrock-chat-classification",
+      "name": "AWS Bedrock Chat Model",
+      "credentials": {
+        "aws": {
+          "id": "eqoGm6slNA3lHKCx",
+          "name": "AWS (IAM) account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n-nodes-langchain.informationExtractor מחליף את $json בפלט שלו לכל item\n// ({ output: {...} } בלבד, או { error: ... } אם onError=continueRegularOutput\n// ונכשל) - מאבד את text_content/user_id/incident_id/names/addresses/ages/\n// phone_numbers שהצמתים הבאים (RAG, Decision Agent) צריכים. משחזרים אותם\n// מהפריטים שיצאו מ-Restore Extraction Context, לפני הסיווג - אותו דפוס\n// בדיוק כמו Restore Ingestion Data / Restore Extraction Context. עוברים\n// עם $input.all() (לא $json/.item של item יחיד) כדי לא לחזור על אותו באג\n// שכבר תיקנו פעמיים היום.\n//\n// risk_level לא מתבקש מה-LLM בכלל, בכוונה - נגזר כאן מטבלת מיפוי קטגוריה->\n// סיכון קבועה (CLASS_TO_RISK, זהה ל-distress_classification.py), כדי\n// שרמת הסיכון תמיד תהיה עקבית עם הקטגוריה ולא תלויה בכך שה-LLM יבחר את\n// שתיהן בהתאמה - אותה החלטת עיצוב בדיוק כמו במקור.\n//\n// אם הקריאה ל-Bedrock נכשלה (item.json.error קיים, בגלל onError=\n// continueRegularOutput למעלה) - נופלים לאותה ברירת מחדל בטוחה כמו הקוד\n// המקורי: \"מצוקה רגשית\" (medium), לא משמיטים את הפנייה.\nconst CLASS_TO_RISK = {\n  \"התאבדות/ארוע חירום\": \"high\",\n  \"מצוקה רגשית\": \"medium\",\n  \"חרם\": \"medium\",\n  \"רגיל\": \"low\",\n};\n\nconst originals = $('Restore Extraction Context').all();\n\nreturn $input.all().map((item, i) => {\n  const original = originals[i].json;\n\n  let label, summary;\n  if (item.json.error) {\n    label = \"מצוקה רגשית\";\n    summary = `שגיאת סיווג מול Bedrock (${item.json.error}) - מנותב לבדיקה אנושית כברירת מחדל בטוחה`;\n  } else {\n    const extracted = item.json.output || {};\n    label = CLASS_TO_RISK.hasOwnProperty(extracted.class) ? extracted.class : \"מצוקה רגשית\";\n    summary = extracted.summary || \"\";\n  }\n\n  return {\n    json: {\n      ...original,\n      class: label,\n      risk_level: CLASS_TO_RISK[label] || \"medium\",\n      summary,\n    },\n  };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -496,
+        -96
+      ],
+      "id": "code-restore-classification-context",
+      "name": "Restore Classification Context"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8000/api/v1/rag-context",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json; charset=utf-8"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -496,
+        -96
+      ],
+      "id": "http-rag-context",
+      "name": "Context Retrieval (RAG - LangChain + Vector DB)"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ 'Incident text: ' + $json.text_content + '\\n\\nRAG context already retrieved: ' + $json.context + '\\n\\nAutomated classification so far: ' + $json.class + ' (risk_level=' + $json.risk_level + ')' }}",
+        "hasOutputParser": true,
+        "options": {
+          "systemMessage": "You are a preliminary clinical framing assistant for SafeSignal, a youth distress triage system. You do NOT make the final risk decision -- a separate, already-validated backend system (LangGraph-based, with its own tool-calling, hallucination checking, and risk routing) makes the authoritative decision immediately after you, using the full incident data directly (not routed through you). Your role is strictly advisory: read the incident text, the RAG context, and the automated classification already computed, and write ONE short preliminary clinical framing note (2-3 sentences, in Hebrew) that a human reviewer could use as a quick first read before the authoritative assessment arrives. Do not invent facts not present in the text. Do not attempt to independently override or restate a risk_level or category -- only describe what you observe."
+        }
+      },
+      "onError": "continueRegularOutput",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        -272,
+        -96
+      ],
+      "id": "http-decision-agent",
+      "name": "Decision Agent (LangGraph + MCP)"
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-2.5-flash",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.1,
+      "position": [
+        -288,
+        112
+      ],
+      "id": "lm-gemini-chat-decision",
+      "name": "Google Gemini Chat Model",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "50m4sa7jxchtLDfK",
+          "name": "Google Gemini - SafeSignal"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"preliminary_note\": {\"type\": \"string\", \"description\": \"2-3 sentence preliminary clinical framing note in Hebrew\"}\n  },\n  \"required\": [\"preliminary_note\"]\n}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        -168,
+        112
+      ],
+      "id": "output-parser-decision-agent",
+      "name": "Decision Agent Output Parser"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8000/api/v1/decision-agent",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json; charset=utf-8"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ ...$('Context Retrieval (RAG - LangChain + Vector DB)').item.json, gemini_preliminary_note: ($json.output || {}).preliminary_note || '' }) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -160,
+        -224
+      ],
+      "id": "http-invoke-decision-agent-backend",
+      "name": "Invoke Decision Agent (Backend)"
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// תצוגה בלבד - Output Screening כבר רץ שרת צד (Bedrock Guardrails + Claude Haiku),\n// כמצוין למעלה ב-Decision Agent (LangGraph + MCP) שלמעלה.\n//\n// צומת Code רץ פעם אחת על כל ה-items (run once for all items) - חובה\n// לעבור על כולם עם $input.all() ולהחזיר item אחד לכל item נכנס. הגרסה\n// הקודמת עבדה רק על $json (item ראשון בלבד) והחזירה מערך בגודל 1 קשיח -\n// מתוך באטש של N הודעות, N-1 נבלעו בשקט ולא המשיכו כלל לניתוב/התרעה\n// (2026-07-21 באג קריטי שהתגלה: הודעת \"רק לא+\" סווגה high-risk על ידי\n// Decision Agent אך מעולם לא הגיעה ל-Send Emergency Email כי לא הייתה\n// ה-item הראשון בבאטש).\nreturn $input.all().map((item) => {\n  const j = item.json;\n  return {\n    json: {\n      ...j,\n      output_screening_summary: `passed=${j.passed} reason=\"${j.screening_reason || \"\"}\" retries=${j.output_retry_count ?? 0}`,\n    },\n  };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -48,
+        -96
+      ],
+      "id": "code-output-screening-result",
+      "name": "Output Screening (Comprehend + ML) - Result"
+    },
+    {
+      "parameters": {
+        "jsCode": "// תצוגה בלבד - risk_level כבר נקבע על ידי routing_by_risk_level_node ב-Python\n// (שקרא ל-webhook risk-routing למטה בעמוד הזה).\n//\n// אותו תיקון כמו ב-Output Screening (Comprehend + ML) - Result: לעבור על כל\n// ה-items עם $input.all() במקום להניח item יחיד, אחרת רוב הבאטש נבלע כאן.\nreturn $input.all().map((item) => {\n  const j = item.json;\n  return {\n    json: {\n      ...j,\n      routing_summary: `risk_level=${j.risk_level || \"unknown\"} action=${j.recommended_action || \"\"}`,\n    },\n  };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        176,
+        -96
+      ],
+      "id": "code-routing-result",
+      "name": "Routing by Risk Level - Result"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "rule-risk-high",
+                    "leftValue": "={{ $json.risk_level }}",
+                    "rightValue": "high",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "rule-risk-medium",
+                    "leftValue": "={{ $json.risk_level }}",
+                    "rightValue": "medium",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "rule-risk-low",
+                    "leftValue": "={{ $json.risk_level }}",
+                    "rightValue": "low",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": 1
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        400,
+        -112
+      ],
+      "id": "switch-risk-level",
+      "name": "Routing by Risk Level"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        624,
+        -288
+      ],
+      "id": "noop-immediate-alert",
+      "name": "Immediate Alert (n8n + WebUI + Polly)"
+    },
+    {
+      "parameters": {
+        "resource": "email",
+        "operation": "send",
+        "isBodyHtml": true,
+        "subject": "=🚨 SafeSignal EMERGENCY ALERT - Incident {{ $json.incident_id }}",
+        "body": "=<div dir=\"rtl\" style=\"font-family:Arial,sans-serif;max-width:640px;margin:0 auto;\"><div style=\"background:#c0392b;color:#fff;padding:16px;text-align:center;font-size:22px;font-weight:bold;border-radius:6px 6px 0 0;\">🚨 התראת חירום — זוהתה סכנת התאבדות אפשרית 🚨</div><div style=\"border:3px solid #c0392b;border-top:none;padding:16px;border-radius:0 0 6px 6px;\"><p style=\"color:#c0392b;font-weight:bold;font-size:16px;\">נדרשת בדיקה אנושית מיידית של הפנייה הבאה:</p><table style=\"width:100%;border-collapse:collapse;margin-bottom:16px;\"><tr><td style=\"padding:6px 10px;border:1px solid #ccc;font-weight:bold;background:#f5f5f5;white-space:nowrap;\">Incident ID</td><td style=\"padding:6px 10px;border:1px solid #ccc;\">{{ $json.incident_id }}</td></tr><tr><td style=\"padding:6px 10px;border:1px solid #ccc;font-weight:bold;background:#f5f5f5;white-space:nowrap;\">User ID</td><td style=\"padding:6px 10px;border:1px solid #ccc;\">{{ $json.user_id }}</td></tr><tr><td style=\"padding:6px 10px;border:1px solid #ccc;font-weight:bold;background:#f5f5f5;white-space:nowrap;\">רמת סיכון</td><td style=\"padding:6px 10px;border:1px solid #ccc;\">{{ $json.risk_level }}</td></tr><tr><td style=\"padding:6px 10px;border:1px solid #ccc;font-weight:bold;background:#f5f5f5;white-space:nowrap;\">דחיפות סופית</td><td style=\"padding:6px 10px;border:1px solid #ccc;\">{{ $json.final_urgency_assessment }}</td></tr><tr><td style=\"padding:6px 10px;border:1px solid #ccc;font-weight:bold;background:#f5f5f5;white-space:nowrap;\">שם/שמות שזוהו</td><td style=\"padding:6px 10px;border:1px solid #ccc;\">{{ ($json.names || []).join(', ') || '(אין שם)' }}</td></tr><tr><td style=\"padding:6px 10px;border:1px solid #ccc;font-weight:bold;background:#f5f5f5;white-space:nowrap;\">כתובות שזוהו</td><td style=\"padding:6px 10px;border:1px solid #ccc;\">{{ ($json.addresses || []).join(', ') || '(אין כתובת)' }}</td></tr><tr><td style=\"padding:6px 10px;border:1px solid #ccc;font-weight:bold;background:#f5f5f5;white-space:nowrap;\">גיל</td><td style=\"padding:6px 10px;border:1px solid #ccc;\">{{ ($json.ages || []).join(', ') || '(אין גיל)' }}</td></tr><tr><td style=\"padding:6px 10px;border:1px solid #ccc;font-weight:bold;background:#f5f5f5;white-space:nowrap;\">טלפון</td><td style=\"padding:6px 10px;border:1px solid #ccc;\">{{ ($json.phone_numbers || []).join(', ') || '(אין טלפון)' }}</td></tr></table><p style=\"font-weight:bold;\">ציטוט ההודעה המקורית:</p><blockquote style=\"background:#fdecea;border-right:4px solid #c0392b;margin:0;padding:10px 14px;font-size:15px;\">{{ $json.text_content }}</blockquote><p style=\"font-weight:bold;margin-top:16px;\">סיכום לצוות האנושי:</p><p>{{ $json.summary_for_human_reviewer }}</p></div></div>",
+        "fromEmail": "yitzhak.maimon1@gmail.com",
+        "toAddresses": ["yitzhak.maimon1@gmail.com"],
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.awsSes",
+      "typeVersion": 1,
+      "position": [
+        848,
+        -288
+      ],
+      "id": "awsses-emergency-email",
+      "name": "Send Emergency Email (AWS SES)",
+      "credentials": {
+        "aws": {
+          "id": "eqoGm6slNA3lHKCx",
+          "name": "AWS (IAM) account 2"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        624,
+        -96
+      ],
+      "id": "noop-human-review",
+      "name": "Human Review (Open WebUI Dashboard)"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        624,
+        96
+      ],
+      "id": "noop-log-close",
+      "name": "Log & Close"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        848,
+        -16
+      ],
+      "id": "respond-final",
+      "name": "Respond to Webhook"
+    }
+  ],
+  "connections": {
+    "Website URL Input": {
+      "main": [
+        [
+          {
+            "node": "Fetch Website Content",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Website Content": {
+      "main": [
+        [
+          {
+            "node": "Extract Website Content",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Website Content": {
+      "main": [
+        [
+          {
+            "node": "Route by Detected Content",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Poll Trigger": {
+      "main": [
+        [
+          {
+            "node": "Telegram Poll Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Poll Config": {
+      "main": [
+        [
+          {
+            "node": "Fetch Telegram Messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Telegram Messages": {
+      "main": [
+        [
+          {
+            "node": "Extract Telegram Messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Telegram Messages": {
+      "main": [
+        [
+          {
+            "node": "Route by Detected Content",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Detected Content": {
+      "main": [
+        [
+          {
+            "node": "Merge Sources",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Image Analysis (Gemini Vision)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Voice Transcription (Groq Whisper)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Image Analysis (Gemini Vision)": {
+      "main": [
+        [
+          {
+            "node": "Merge Sources",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Voice Transcription (Groq Whisper)": {
+      "main": [
+        [
+          {
+            "node": "Merge Sources",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "Merge Sources": {
+      "main": [
+        [
+          {
+            "node": "Unified Ingestion (Backend)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Unified Ingestion (Backend)": {
+      "main": [
+        [
+          {
+            "node": "Upload a file",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload a file": {
+      "main": [
+        [
+          {
+            "node": "Restore Ingestion Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore Ingestion Data": {
+      "main": [
+        [
+          {
+            "node": "Text Analysis (HeBERT + Comprehend)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Text Analysis (HeBERT + Comprehend)": {
+      "main": [
+        [
+          {
+            "node": "Passed Input Screening?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Passed Input Screening?": {
+      "main": [
+        [
+          {
+            "node": "Relevant Information Extraction (Ollama)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reject",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reject": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Relevant Information Extraction (Ollama)": {
+      "main": [
+        [
+          {
+            "node": "Restore Extraction Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Relevant Information Extraction (Ollama)",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore Extraction Context": {
+      "main": [
+        [
+          {
+            "node": "Distress Classification (Bedrock)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Distress Classification (Bedrock)": {
+      "main": [
+        [
+          {
+            "node": "Restore Classification Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AWS Bedrock Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Distress Classification (Bedrock)",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Structured Output Parser": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Distress Classification (Bedrock)",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore Classification Context": {
+      "main": [
+        [
+          {
+            "node": "Context Retrieval (RAG - LangChain + Vector DB)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Context Retrieval (RAG - LangChain + Vector DB)": {
+      "main": [
+        [
+          {
+            "node": "Decision Agent (LangGraph + MCP)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decision Agent (LangGraph + MCP)": {
+      "main": [
+        [
+          {
+            "node": "Invoke Decision Agent (Backend)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Decision Agent (LangGraph + MCP)",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decision Agent Output Parser": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Decision Agent (LangGraph + MCP)",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Invoke Decision Agent (Backend)": {
+      "main": [
+        [
+          {
+            "node": "Output Screening (Comprehend + ML) - Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Output Screening (Comprehend + ML) - Result": {
+      "main": [
+        [
+          {
+            "node": "Routing by Risk Level - Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Routing by Risk Level - Result": {
+      "main": [
+        [
+          {
+            "node": "Routing by Risk Level",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Routing by Risk Level": {
+      "main": [
+        [
+          {
+            "node": "Immediate Alert (n8n + WebUI + Polly)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Human Review (Open WebUI Dashboard)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log & Close",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Immediate Alert (n8n + WebUI + Polly)": {
+      "main": [
+        [
+          {
+            "node": "Send Emergency Email (AWS SES)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Emergency Email (AWS SES)": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Human Review (Open WebUI Dashboard)": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log & Close": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "8cea4eb70e4e834fd29167fea3ccb338d84dd360c9b830ed3f139d714492cd04"
+  }
+}
