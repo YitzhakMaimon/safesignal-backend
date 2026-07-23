@@ -12,6 +12,7 @@ data/
 # תוצר בנייה נגזר (FAISS index + docstore) - נבנה מחדש אוטומטית מ-
 # training/distress_dataset_final.txt אם חסר/לא מעודכן, אין צורך ב-git
 training/faiss_index/
+services/rag_service/training/faiss_index/
 
 # מודל HeBERT מאומן (~418MB, בעיקר model.safetensors) - הורדה/חילוץ מ-
 # hebert_distress_model.zip שנוצר ב-training/train_hebert_colab.ipynb, לא קוד.
@@ -20,3 +21,6 @@ hebert_distress_model/
 
 *.zip
 *.log
+
+# מפתח SSH פרטי ל-EC2 (safesignal-shared-key.pem) - לעולם לא נכנס ל-git.
+*.pem

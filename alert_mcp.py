@@ -3,14 +3,20 @@ FastMCP server exposing the immediate-alert tool for the SafeSignal Decision Age
 
 Forwards escalation requests to the n8n workflow, which is responsible for placing
 the Amazon Polly voice call / notification (n8n.json, "immediate-alert" webhook).
-Run standalone: `python alert_mcp.py` (serves Streamable HTTP on :8001/mcp).
+Run standalone: `python alert_mcp.py` (serves Streamable HTTP on :8011/mcp by default).
+
+Moved off :8001 (2026-07-22) -- that port is now services/rag_service's HTTP
+API in the 4-service microservices split; running both on :8001 would collide.
 """
+import os
+
 import requests
 from mcp.server.fastmcp import FastMCP
 
-ALERT_WEBHOOK_URL = "http://localhost:5678/webhook/immediate-alert"
+ALERT_WEBHOOK_URL = os.environ.get("ALERT_WEBHOOK_URL", "http://localhost:5678/webhook/immediate-alert")
+MCP_PORT = int(os.environ.get("ALERT_MCP_PORT", "8011"))
 
-mcp = FastMCP("safesignal-alert", host="0.0.0.0", port=8001)
+mcp = FastMCP("safesignal-alert", host="0.0.0.0", port=MCP_PORT)
 
 
 @mcp.tool()

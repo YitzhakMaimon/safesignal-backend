@@ -1,0 +1,103 @@
+services:
+  rag_service:
+    build: ./services/rag_service
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    environment:
+      - BEDROCK_AWS_REGION=us-east-1
+    volumes:
+      - ${HOME}/.aws:/root/.aws:ro
+
+  image_analyser:
+    build: ./services/image_analyser
+    ports:
+      - "8002:8002"
+    env_file:
+      - .env
+
+  guardrails_service:
+    build: ./services/guardrails_service
+    ports:
+      - "8003:8003"
+    env_file:
+      - .env
+    environment:
+      - BEDROCK_AWS_REGION=us-east-1
+      - HEBERT_MODEL_PATH=/app/hebert_distress_model
+    volumes:
+      - ${HOME}/.aws:/root/.aws:ro
+      # ~419MB fine-tuned weights, deliberately not baked into the image (see
+      # services/guardrails_service/Dockerfile) -- mounted read-only instead.
+      - ./hebert_distress_model:/app/hebert_distress_model:ro
+
+  # Standalone async Output Screening service (Bedrock Guardrails + Claude
+  # Haiku), replacing guardrails_service's /check/output as what
+  # langgraph_agent's output_screening_node actually calls -- see
+  # services/output_screening/main.py and agent_graph.py's
+  # _check_output_via_screening_service.
+  output_screening:
+    build: ./services/output_screening
+    ports:
+      - "8005:8005"
+    env_file:
+      - .env
+    environment:
+      - BEDROCK_AWS_REGION=us-east-1
+    volumes:
+      - ${HOME}/.aws:/root/.aws:ro
+
+  # alert_mcp / rag_mcp are NOT part of the 4-service roadmap and have no
+  # services/ subdirectory of their own -- they're the pre-existing FastMCP
+  # tool servers langgraph_agent depends on for real (non-mock) tool calls.
+  # Included here so the compose stack is fully live end-to-end rather than
+  # silently falling back to mock tools when alert_mcp/rag_mcp aren't running.
+  alert_mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.alert_mcp
+    ports:
+      - "8011:8011"
+    environment:
+      # n8n runs on the Windows host, not in this compose stack -- "localhost"
+      # from inside a container means the container itself, not the host.
+      - ALERT_WEBHOOK_URL=http://host.docker.internal:5678/webhook/immediate-alert
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  rag_mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.rag_mcp
+    ports:
+      - "8012:8012"
+    environment:
+      - RAG_SERVICE_QUERY_URL=http://rag_service:8001/query
+    depends_on:
+      - rag_service
+
+  langgraph_agent:
+    build: ./services/langgraph_agent
+    ports:
+      - "8004:8004"
+    env_file:
+      - .env
+    environment:
+      - BEDROCK_AWS_REGION=us-east-1
+      - ALERT_MCP_URL=http://alert_mcp:8011/mcp
+      - RAG_MCP_URL=http://rag_mcp:8012/mcp
+      - OUTPUT_SCREENING_URL=http://output_screening:8005/v1/screen
+      # n8n and safesignal.py both run on the Windows host, outside this
+      # compose stack -- same host.docker.internal reasoning as alert_mcp above.
+      - ROUTING_WEBHOOK_URL=http://host.docker.internal:5678/webhook/risk-routing
+      - ALERT_WEBHOOK_URL=http://host.docker.internal:8000/api/v1/immediate-alert
+      - REVIEW_QUEUE_URL=http://host.docker.internal:8000/api/v1/review-queue
+    volumes:
+      - ${HOME}/.aws:/root/.aws:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - alert_mcp
+      - rag_mcp
+      - output_screening

@@ -231,7 +231,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "http://host.docker.internal:8000/api/v1/vision/textract-rekognition",
+        "url": "http://3.85.191.105:8001/api/v1/vision/textract-rekognition",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -542,7 +542,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "http://host.docker.internal:8000/api/v1/rag-context",
+        "url": "http://3.89.7.120:8001/api/v1/rag-context",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -622,7 +622,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "http://host.docker.internal:8000/api/v1/decision-agent",
+        "url": "http://host.docker.internal:18001/api/v1/decision-agent",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -660,11 +660,11 @@
         -96
       ],
       "id": "code-output-screening-result",
-      "name": "Output Screening (Comprehend + ML) - Result"
+      "name": "Output Screening (Bedrock Guardrails + Claude Haiku) - Result"
     },
     {
       "parameters": {
-        "jsCode": "// תצוגה בלבד - risk_level כבר נקבע על ידי routing_by_risk_level_node ב-Python\n// (שקרא ל-webhook risk-routing למטה בעמוד הזה).\n//\n// אותו תיקון כמו ב-Output Screening (Comprehend + ML) - Result: לעבור על כל\n// ה-items עם $input.all() במקום להניח item יחיד, אחרת רוב הבאטש נבלע כאן.\nreturn $input.all().map((item) => {\n  const j = item.json;\n  return {\n    json: {\n      ...j,\n      routing_summary: `risk_level=${j.risk_level || \"unknown\"} action=${j.recommended_action || \"\"}`,\n    },\n  };\n});\n"
+        "jsCode": "// תצוגה בלבד - risk_level כבר נקבע על ידי routing_by_risk_level_node ב-Python\n// (שקרא ל-webhook risk-routing למטה בעמוד הזה).\n//\n// אותו תיקון כמו ב-Output Screening (Bedrock Guardrails + Claude Haiku) - Result: לעבור על כל\n// ה-items עם $input.all() במקום להניח item יחיד, אחרת רוב הבאטש נבלע כאן.\nreturn $input.all().map((item) => {\n  const j = item.json;\n  return {\n    json: {\n      ...j,\n      routing_summary: `risk_level=${j.risk_level || \"unknown\"} action=${j.recommended_action || \"\"}`,\n    },\n  };\n});\n"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -1169,14 +1169,14 @@
       "main": [
         [
           {
-            "node": "Output Screening (Comprehend + ML) - Result",
+            "node": "Output Screening (Bedrock Guardrails + Claude Haiku) - Result",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Output Screening (Comprehend + ML) - Result": {
+    "Output Screening (Bedrock Guardrails + Claude Haiku) - Result": {
       "main": [
         [
           {

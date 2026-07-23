@@ -61,8 +61,8 @@ from mcp.client.streamable_http import streamablehttp_client
 from local_storage import save_immediate_alert_record
 from schemas import AgentState, DecisionOutput
 
-ALERT_MCP_URL = "http://localhost:8001/mcp"
-RAG_MCP_URL = "http://localhost:8002/mcp"
+ALERT_MCP_URL = os.environ.get("ALERT_MCP_URL", "http://localhost:8011/mcp")
+RAG_MCP_URL = os.environ.get("RAG_MCP_URL", "http://localhost:8012/mcp")
 
 MODEL_NAME = os.environ.get("DECISION_AGENT_MODEL", "gemini-2.5-flash")
 
