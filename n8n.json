@@ -53,100 +53,6 @@
     },
     {
       "parameters": {
-        "rule": {
-          "interval": [
-            {
-              "field": "minutes",
-              "minutesInterval": 20
-            }
-          ]
-        }
-      },
-      "notes": "לשינוי תדירות הסריקה: לפתוח את הצומת הזה ולערוך את minutesInterval. n8n לא מאפשר לצומת טריגר לקרוא ערך דינמי מצומת אחר, ולכן זה חייב להיקבע כאן ולא ב-Telegram Poll Config.",
-      "notesInFlow": true,
-      "type": "n8n-nodes-base.scheduleTrigger",
-      "typeVersion": 1.2,
-      "position": [
-        -3408,
-        320
-      ],
-      "id": "schedule-telegram-poll",
-      "name": "Telegram Poll Trigger"
-    },
-    {
-      "parameters": {
-        "jsCode": "// כאן קובעים בקלות מאיזו קבוצה/ערוץ בטלגרם למשוך וכמה הודעות בכל סריקה.\n// את תדירות הסריקה (כל כמה זמן) קובעים בצומת הקודם (Telegram Poll Trigger),\n// כי צמתי Trigger ב-n8n לא יכולים לקרוא ערך דינמי מצומת אחר - זו מגבלה של\n// n8n עצמו, לא בחירה שלנו.\nreturn [{\n  json: {\n    peer_id: \"2097208579\",\n    limit: 10\n  }\n}];\n"
-      },
-      "notes": "לשינוי כמות ההודעות שנמשכות או הקבוצה/ערוץ: לערוך peer_id ו-limit כאן.",
-      "notesInFlow": true,
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        -3184,
-        320
-      ],
-      "id": "code-telegram-poll-config",
-      "name": "Telegram Poll Config"
-    },
-    {
-      "parameters": {
-        "url": "=https://telegram155.p.rapidapi.com/v1/peers/{{ $json.peer_id }}/history",
-        "sendQuery": true,
-        "queryParameters": {
-          "parameters": [
-            {
-              "name": "limit",
-              "value": "={{ $json.limit }}"
-            }
-          ]
-        },
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            {
-              "name": "X-RapidAPI-Host",
-              "value": "telegram155.p.rapidapi.com"
-            }
-          ]
-        },
-        "authentication": "genericCredentialType",
-        "genericAuthType": "httpHeaderAuth",
-        "options": {
-          "allowUnauthorizedCerts": true
-        }
-      },
-      "notes": "אישורים כבר מוגדרים (קרדנציאל 'RapidAPI Telegram155 Key' נוצר ב-n8n דרך ה-API, לא נשמר כאן ב-JSON). allowUnauthorizedCerts דרוש בגלל בעיית SSL של הרשת הארגונית - אותה בעיה שבגללה גם ל-Fetch Website Content יש את האופציה הזו.",
-      "notesInFlow": true,
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        -2960,
-        320
-      ],
-      "id": "http-fetch-telegram-messages",
-      "name": "Fetch Telegram Messages",
-      "credentials": {
-        "httpHeaderAuth": {
-          "id": "xYXwjoeJmb7G0nZK",
-          "name": "RapidAPI Telegram155 Key"
-        }
-      }
-    },
-    {
-      "parameters": {
-        "jsCode": "// לוקח את מערך messages שחזר מ-RapidAPI (Telegram155 getHistory) והופך כל הודעה\n// עם טקסט לפריט נפרד עם _route: \"text\", באותו פורמט שמצפה לו Route by Detected\n// Content (בדיוק כמו Extract Website Content). הודעות בלי טקסט (מדיה בלבד) מדולגות.\n//\n// RapidAPI מחזיר את ההודעות מהחדשה לישנה (msg.id/msg.date יורדים). הופכים\n// את הסדר (oldest-first) לפני היצירה, כדי שהשורות שנכתבות לאקסל המצטבר\n// יהיו בסדר כרונולוגי, במקום הפוך בכל באטש (2026-07-20 באג שהתגלה בבדיקה).\n// גם שולחים הלאה את msg.date (זמן שליחה אמיתי של ההודעה בטלגרם, unix\n// epoch) בתור telegram_message_date - כדי שהעמודה timestamp באקסל תשקף מתי\n// ההודעה נשלחה בפועל, לא מתי הריצה שלנו עיבדה אותה.\n//\n// לגבי תמונות/סרטונים: תגובת ה-API מכילה כרגע רק מבנה MTProto גולמי של המדיה\n// (media.photo / media.video עם file_reference/dcid) ולא קישור URL שניתן להוריד\n// ישירות - לכן עדיין לא מנתבים אותם ל-Image Analysis. מסמנים has_photo/has_video\n// לצורך נראות בלבד, עד שנברר מול RapidAPI endpoint ייעודי להורדת מדיה.\nconst config = $('Telegram Poll Config').item.json;\nconst peerId = config.peer_id;\n\nconst response = $json;\nconst messages = [...(response.messages || [])].reverse();\n\nconst items = [];\nfor (const msg of messages) {\n  const text = (msg.message || \"\").trim();\n  if (!text) continue; // הודעת מדיה בלבד, אין מה לנתח\n\n  const fromId = msg.from_id || {};\n  const senderUserId = fromId.user_id;\n  const userId = senderUserId ? `telegram:${senderUserId}` : \"anonymous\";\n\n  const media = msg.media || {};\n  const hasPhoto = Boolean(media.photo);\n  const hasVideo = Boolean(media.video) || Boolean(media.document && (media.document.mime_type || \"\").startsWith(\"video/\"));\n\n  items.push({\n    json: {\n      _route: \"text\",\n      text_content: text,\n      user_id: userId,\n      incident_id: `telegram-${peerId}-${msg.id}`,\n      telegram_message_id: msg.id,\n      telegram_message_date: msg.date,\n      telegram_peer_id: peerId,\n      has_photo: hasPhoto,\n      has_video: hasVideo\n    }\n  });\n}\n\nreturn items;\n"
-      },
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        -2736,
-        320
-      ],
-      "id": "code-extract-telegram-messages",
-      "name": "Extract Telegram Messages"
-    },
-    {
-      "parameters": {
         "rules": {
           "values": [
             {
@@ -648,7 +554,6 @@
       "id": "http-invoke-decision-agent-backend",
       "name": "Invoke Decision Agent (Backend)"
     },
-
     {
       "parameters": {
         "jsCode": "// תצוגה בלבד - Output Screening כבר רץ שרת צד (Bedrock Guardrails + Claude Haiku),\n// כמצוין למעלה ב-Decision Agent (LangGraph + MCP) שלמעלה.\n//\n// צומת Code רץ פעם אחת על כל ה-items (run once for all items) - חובה\n// לעבור על כולם עם $input.all() ולהחזיר item אחד לכל item נכנס. הגרסה\n// הקודמת עבדה רק על $json (item ראשון בלבד) והחזירה מערך בגודל 1 קשיח -\n// מתוך באטש של N הודעות, N-1 נבלעו בשקט ולא המשיכו כלל לניתוב/התרעה\n// (2026-07-21 באג קריטי שהתגלה: הודעת \"רק לא+\" סווגה high-risk על ידי\n// Decision Agent אך מעולם לא הגיעה ל-Send Emergency Email כי לא הייתה\n// ה-item הראשון בבאטש).\nreturn $input.all().map((item) => {\n  const j = item.json;\n  return {\n    json: {\n      ...j,\n      output_screening_summary: `passed=${j.passed} reason=\"${j.screening_reason || \"\"}\" retries=${j.output_retry_count ?? 0}`,\n    },\n  };\n});\n"
@@ -779,7 +684,9 @@
         "subject": "=🚨 SafeSignal EMERGENCY ALERT - Incident {{ $json.incident_id }}",
         "body": "=<div dir=\"rtl\" style=\"font-family:Arial,sans-serif;max-width:640px;margin:0 auto;\"><div style=\"background:#c0392b;color:#fff;padding:16px;text-align:center;font-size:22px;font-weight:bold;border-radius:6px 6px 0 0;\">🚨 התראת חירום — זוהתה סכנת התאבדות אפשרית 🚨</div><div style=\"border:3px solid #c0392b;border-top:none;padding:16px;border-radius:0 0 6px 6px;\"><p style=\"color:#c0392b;font-weight:bold;font-size:16px;\">נדרשת בדיקה אנושית מיידית של הפנייה הבאה:</p><table style=\"width:100%;border-collapse:collapse;margin-bottom:16px;\"><tr><td style=\"padding:6px 10px;border:1px solid #ccc;font-weight:bold;background:#f5f5f5;white-space:nowrap;\">Incident ID</td><td style=\"padding:6px 10px;border:1px solid #ccc;\">{{ $json.incident_id }}</td></tr><tr><td style=\"padding:6px 10px;border:1px solid #ccc;font-weight:bold;background:#f5f5f5;white-space:nowrap;\">User ID</td><td style=\"padding:6px 10px;border:1px solid #ccc;\">{{ $json.user_id }}</td></tr><tr><td style=\"padding:6px 10px;border:1px solid #ccc;font-weight:bold;background:#f5f5f5;white-space:nowrap;\">רמת סיכון</td><td style=\"padding:6px 10px;border:1px solid #ccc;\">{{ $json.risk_level }}</td></tr><tr><td style=\"padding:6px 10px;border:1px solid #ccc;font-weight:bold;background:#f5f5f5;white-space:nowrap;\">דחיפות סופית</td><td style=\"padding:6px 10px;border:1px solid #ccc;\">{{ $json.final_urgency_assessment }}</td></tr><tr><td style=\"padding:6px 10px;border:1px solid #ccc;font-weight:bold;background:#f5f5f5;white-space:nowrap;\">שם/שמות שזוהו</td><td style=\"padding:6px 10px;border:1px solid #ccc;\">{{ ($json.names || []).join(', ') || '(אין שם)' }}</td></tr><tr><td style=\"padding:6px 10px;border:1px solid #ccc;font-weight:bold;background:#f5f5f5;white-space:nowrap;\">כתובות שזוהו</td><td style=\"padding:6px 10px;border:1px solid #ccc;\">{{ ($json.addresses || []).join(', ') || '(אין כתובת)' }}</td></tr><tr><td style=\"padding:6px 10px;border:1px solid #ccc;font-weight:bold;background:#f5f5f5;white-space:nowrap;\">גיל</td><td style=\"padding:6px 10px;border:1px solid #ccc;\">{{ ($json.ages || []).join(', ') || '(אין גיל)' }}</td></tr><tr><td style=\"padding:6px 10px;border:1px solid #ccc;font-weight:bold;background:#f5f5f5;white-space:nowrap;\">טלפון</td><td style=\"padding:6px 10px;border:1px solid #ccc;\">{{ ($json.phone_numbers || []).join(', ') || '(אין טלפון)' }}</td></tr></table><p style=\"font-weight:bold;\">ציטוט ההודעה המקורית:</p><blockquote style=\"background:#fdecea;border-right:4px solid #c0392b;margin:0;padding:10px 14px;font-size:15px;\">{{ $json.text_content }}</blockquote><p style=\"font-weight:bold;margin-top:16px;\">סיכום לצוות האנושי:</p><p>{{ $json.summary_for_human_reviewer }}</p></div></div>",
         "fromEmail": "yitzhak.maimon1@gmail.com",
-        "toAddresses": ["yitzhak.maimon1@gmail.com"],
+        "toAddresses": [
+          "yitzhak.maimon1@gmail.com"
+        ],
         "additionalFields": {}
       },
       "type": "n8n-nodes-base.awsSes",
@@ -859,50 +766,6 @@
       ]
     },
     "Extract Website Content": {
-      "main": [
-        [
-          {
-            "node": "Route by Detected Content",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Telegram Poll Trigger": {
-      "main": [
-        [
-          {
-            "node": "Telegram Poll Config",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Telegram Poll Config": {
-      "main": [
-        [
-          {
-            "node": "Fetch Telegram Messages",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Fetch Telegram Messages": {
-      "main": [
-        [
-          {
-            "node": "Extract Telegram Messages",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Extract Telegram Messages": {
       "main": [
         [
           {

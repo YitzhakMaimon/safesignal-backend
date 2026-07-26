@@ -3,6 +3,8 @@ import os
 
 from anthropic import AnthropicBedrock
 
+from local_storage import save_token_usage_record
+
 # מודל Claude שנקרא דרך Amazon Bedrock (ולא מול ה-API הישיר של Anthropic), כך שהסיווג
 # רץ תחת אותה תשתית AWS שכבר משמשת את הפרויקט (Comprehend ב-ml_comprehend.py). ה-"us." בתחילת
 # המזהה הוא cross-region inference profile - Bedrock דורש אותו להזמנת מודלים חדשים
@@ -15,11 +17,27 @@ BEDROCK_AWS_REGION = os.environ.get("BEDROCK_AWS_REGION", "us-east-1")
 # מיפוי קטגוריה -> רמת סיכון. נשמר כטבלת בקרה נפרדת (ולא מוחזר ישירות מהמודל) כדי
 # שרמת הסיכון תמיד תהיה עקבית עם הקטגוריה, ולא תלויה בכך שה-LLM יבחר את שתיהן בהתאמה.
 CLASS_TO_RISK = {
-    "התאבדות/ארוע חירום": "high",
+    "ארוע חירום התאבדות": "high",
     "מצוקה רגשית": "medium",
-    "חרם": "medium",
+    "חרם ובריונות ברשת": "medium",
     "רגיל": "low",
 }
+
+# מיפוי קטגוריה -> קוד קטגוריה באנגלית, כפי שהדשבורד מציג אותה (ר' safesignal-dashboard's
+# src/types/incident.ts -- DistressCategory). "רגיל" (הסינון הראשוני היה כנראה
+# false positive, אין בפועל מצוקה) לא ממופה בכוונה: היא נשארת קטגוריה פנימית בלבד
+# ואינה מוצגת כתג בממשק.
+CLASS_TO_CATEGORY_CODE = {
+    "מצוקה רגשית": "emotional_distress",
+    "חרם ובריונות ברשת": "cyberbullying",
+    "ארוע חירום התאבדות": "suicide_emergency",
+}
+
+
+def category_code_for(label: str) -> str | None:
+    """מתרגם תווית distress_classification (עברית) לקוד הקטגוריה באנגלית שהדשבורד
+    מציג. מחזיר None עבור "רגיל" או כל תווית לא מזוהה."""
+    return CLASS_TO_CATEGORY_CODE.get(label)
 
 # הטקסט שמגיע לכאן כבר עבר את שלב הסינון הראשוני (ml_comprehend.py: Comprehend/HeBERT) שסימן
 # אותו כחשוד במצוקה - זהו שלב סיווג משני ומדויק יותר, לא הסינון הראשוני עצמו. קטגוריית
@@ -30,12 +48,14 @@ CLASSIFICATION_SYSTEM_PROMPT = """את/ה מסווג/ת מצוקה עבור מו
 
 סווג/י את ההודעה (בעברית או באנגלית) לאחת מהקטגוריות הבאות בדיוק:
 
-- "התאבדות/ארוע חירום": סימנים ברורים לכוונה אובדנית או לסכנת חיים מיידית (למשל תכנון
+- "ארוע חירום התאבדות": סימנים ברורים לכוונה אובדנית או לסכנת חיים מיידית (למשל תכנון
   לפגוע בעצמו/ה, פרידה/מכתב פרידה, "לסיים עם הכל"). להשתמש בקטגוריה זו רק כשיש רמז
   מפורש בטקסט - לא להסיק מעבר למה שכתוב.
 - "מצוקה רגשית": ביטויי בדידות, ייאוש, עצב, חוסר אונים או מצוקה נפשית שאינם מגיעים
   לרמת סיכון מיידי לחיים.
-- "חרם": הדרה חברתית, נידוי, בריונות חברתית ("כולם מתעלמים ממני", "מחרימים אותי").
+- "חרם ובריונות ברשת": הדרה חברתית, נידוי, בריונות חברתית או ברשת - הטרדה, השפלה או
+  הפצת תוכן פוגעני חוזרים ("כולם מתעלמים ממני", "מחרימים אותי", "כולם מציקים לי
+  בקבוצה", תגובות משפילות/מאיימות ברשתות חברתיות).
 - "רגיל": לאחר קריאה מדוקדקת, אין בטקסט בפועל סימני מצוקה משמעותיים (כלומר הסינון
   הראשוני היה כנראה false positive - למשל סרקזם, ביטוי סלנג לא מילולי, או הקשר תמים).
 
@@ -64,7 +84,7 @@ class BedrockDistressClassifier:
         self.model = model
         self.client = AnthropicBedrock(aws_region=aws_region)
 
-    def classify(self, text: str) -> dict:
+    def classify(self, text: str, incident_id: str = "") -> dict:
         if not text or not text.strip():
             return {"class": "רגיל", "risk_level": "low", "summary": "אין טקסט לניתוח"}
 
@@ -77,6 +97,14 @@ class BedrockDistressClassifier:
                     "format": {"type": "json_schema", "schema": CLASSIFICATION_SCHEMA}
                 },
                 messages=[{"role": "user", "content": text}],
+            )
+            save_token_usage_record(
+                pipeline_stage="distress_classification",
+                model_id=self.model,
+                sentence=text,
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+                incident_id=incident_id,
             )
             block = next(b for b in response.content if b.type == "text")
             parsed = json.loads(block.text)

@@ -3,7 +3,7 @@ from typing import Annotated, Any, Dict, List, Literal
 
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class AgentState(BaseModel):
@@ -18,9 +18,12 @@ class AgentState(BaseModel):
 
     # Identifying details pulled out by Relevant Information Extraction
     # (info_extraction.py, local Ollama NER) earlier in the pipeline. Threaded
-    # through so log_and_close_node's S3 archive includes them, not just the
-    # risk assessment -- see log_and_close_node's docstring for the PII
-    # handling tradeoff this represents.
+    # through so safesignal.py's _persist_and_broadcast_incident can store
+    # them in the extracted_entities DB table, and so immediate_alert_node
+    # can include them in the high-risk alert webhook payload (the human
+    # responder needs identifying details for an emergency page). Never
+    # written to S3 -- log_raw_message's S3 archive only carries
+    # incident_id/user_id/text_content/timestamp.
     names: List[str] = Field(default_factory=list)
     addresses: List[str] = Field(default_factory=list)
     ages: List[int] = Field(default_factory=list)
@@ -59,6 +62,26 @@ class AgentState(BaseModel):
     risk_level: str = ""
 
 
+class IncidentStatusUpdate(BaseModel):
+    """Validates the PATCH /api/v1/incidents/{id}/status request body sent by
+    the dashboard's action bar (Acknowledge/Escalate/False Positive/Close)."""
+
+    status: Literal["investigating", "false_positive", "escalated", "closed"]
+    is_unread: bool | None = Field(default=None, alias="isUnread")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class IngestionSettingsUpdate(BaseModel):
+    """Validates the PUT /api/v1/settings/scan request body sent by the
+    dashboard's Operational Metrics settings panel."""
+
+    message_limit: int = Field(alias="messageLimit", ge=1, le=50)
+    interval_minutes: int = Field(alias="intervalMinutes", ge=1, le=1440)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class DecisionOutput(BaseModel):
     """Structured output schema forced on the LLM via `.with_structured_output()`."""
 
@@ -70,7 +93,12 @@ class DecisionOutput(BaseModel):
             "e.g. ['trigger_immediate_alert']. Empty list if none were needed."
         ),
     )
-    final_urgency_assessment: Literal["Low", "Medium", "High", "Critical"] = Field(
+    # Lowercase, 3-level -- matches routing_by_risk_level_node's risk_level
+    # vocabulary exactly, so the graph never carries two differently-cased,
+    # differently-sized urgency scales side by side (see decision_agent_graph.py
+    # URGENCY_TO_RISK_LEVEL, which used to need to collapse a 4th "Critical"
+    # tier down to "high" -- that tier no longer exists at the source).
+    final_urgency_assessment: Literal["low", "medium", "high"] = Field(
         description="Final urgency level determined for this incident."
     )
     recommended_action: str = Field(description="Short description of the next routing step.")

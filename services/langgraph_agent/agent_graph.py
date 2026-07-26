@@ -54,7 +54,6 @@ from langgraph.prebuilt import ToolNode
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
-from local_storage import save_immediate_alert_record
 from schemas import AgentState, DecisionOutput
 
 ALERT_MCP_URL = os.environ.get("ALERT_MCP_URL", "http://localhost:8011/mcp")
@@ -68,6 +67,10 @@ MAX_OUTPUT_RETRIES = 3
 
 # --- Routing by risk level (n8n workflow, with a local fallback) ---
 ROUTING_WEBHOOK_URL = os.environ.get("ROUTING_WEBHOOK_URL", "http://localhost:5678/webhook/risk-routing")
+# "critical" can no longer come from final_urgency_assessment itself (schemas.py
+# now constrains it to low/medium/high), but _fallback_risk_level's other input,
+# state.distress_classification, is free text set by safesignal.py from whatever
+# the upstream classifier sent -- kept here defensively for that path only.
 URGENCY_TO_RISK_LEVEL = {"critical": "high", "high": "high", "medium": "medium", "low": "low"}
 
 BEDROCK_AWS_REGION = os.environ.get("BEDROCK_AWS_REGION", "us-east-1")
@@ -98,7 +101,7 @@ def build_mock_tools() -> list:
         """
         Trigger an immediate human/Amazon Polly voice alert for a high-risk incident.
         Call this only when the situation requires urgent human intervention (e.g.
-        Critical or High urgency with an imminent safety risk).
+        High urgency with an imminent safety risk).
 
         Args:
             incident_id: Unique identifier of the incident being escalated.
@@ -138,7 +141,7 @@ def _build_system_prompt(state: AgentState) -> str:
         f"Automated distress classification: {state.distress_classification}\n"
         f"Passive RAG context already retrieved: {state.initial_rag_context}\n\n"
         "Available tools:\n"
-        "- trigger_immediate_alert: use ONLY for Critical/High urgency situations that "
+        "- trigger_immediate_alert: use ONLY for High urgency situations that "
         "need immediate human/Amazon Polly voice intervention.\n"
         "- query_rag_history: use when this specific user's own historical incident "
         "pattern would materially change the urgency assessment and isn't already "
@@ -202,8 +205,8 @@ def should_continue(state: AgentState) -> str:
 def _context_severity_from_state(state: AgentState) -> str:
     """
     Maps this project's actual urgency vocabulary onto the screening
-    service's context_severity input. final_urgency_assessment ("Low" /
-    "Medium" / "High" / "Critical") is what's actually populated at this
+    service's context_severity input. final_urgency_assessment ("low" /
+    "medium" / "high") is what's actually populated at this
     point in the graph -- state.risk_level is NOT: it's only set afterwards
     by routing_by_risk_level_node, which runs *after* output_screening, so
     it's always "" here and can't be used for this decision.
@@ -230,7 +233,12 @@ async def _check_output_via_screening_service(incident_id: str, text: str, conte
     hanging or silently letting unchecked content through.
     """
     try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
+        # 12s, not the original 3s: the microservice's own Bedrock Guardrails +
+        # Claude Haiku round-trip legitimately takes 7-8s (observed via its
+        # request logs), so a 3s client timeout tripped on every single call
+        # even when the service returned 200 -- this fail-safe layer was
+        # permanently unreachable in practice, not just on real outages.
+        async with httpx.AsyncClient(timeout=12.0) as client:
             response = await client.post(
                 OUTPUT_SCREENING_URL,
                 json={"event_id": incident_id, "raw_llm_output": text, "context_severity": context_severity},
@@ -389,14 +397,6 @@ def immediate_alert_node(state: AgentState) -> dict:
     except requests.exceptions.RequestException as e:
         print(f"[Immediate Alert Error] could not reach alert webhook: {e}")
         alert_status = f"alert_failed: {e}"
-
-    save_immediate_alert_record(
-        incident_id=state.incident_id,
-        user_id=state.user_id,
-        risk_level=state.risk_level,
-        alert_status=alert_status,
-        urgency_reason=state.summary_for_human_reviewer or state.thought_process,
-    )
 
     return {"recommended_action": alert_status}
 

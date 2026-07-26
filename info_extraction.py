@@ -2,6 +2,8 @@ import json
 
 import requests
 
+from local_storage import save_token_usage_record
+
 # "127.0.0.1" ולא "localhost": על מכונות עם WSL2 מותקן, wslrelay.exe נצמד גם הוא
 # לפורט 11434 על ::1 (IPv6) ומיירט חלק מהחיבורים ל"localhost" עוד לפני שהם מגיעים
 # ל-Ollama האמיתי (שנצמד רק ל-127.0.0.1), מה שגורם ל-hang/connection-reset אקראיים.
@@ -69,7 +71,7 @@ class RelevantInfoExtractor:
         except requests.RequestException as e:
             print(f"[Ollama Warm-up Error] {e}")
 
-    def extract(self, text: str) -> dict:
+    def extract(self, text: str, incident_id: str = "") -> dict:
         empty = {"names": [NO_NAME_PLACEHOLDER], "addresses": [], "ages": [], "phone_numbers": []}
         if not text or not text.strip():
             return empty
@@ -87,7 +89,16 @@ class RelevantInfoExtractor:
                 timeout=self.timeout,
             )
             response.raise_for_status()
-            parsed = json.loads(response.json().get("response", "{}"))
+            response_body = response.json()
+            save_token_usage_record(
+                pipeline_stage="info_extraction",
+                model_id=self.model,
+                sentence=text,
+                input_tokens=response_body.get("prompt_eval_count", 0),
+                output_tokens=response_body.get("eval_count", 0),
+                incident_id=incident_id,
+            )
+            parsed = json.loads(response_body.get("response", "{}"))
         except (requests.RequestException, json.JSONDecodeError, ValueError) as e:
             print(f"[Ollama Extraction Error] {e}")
             return empty

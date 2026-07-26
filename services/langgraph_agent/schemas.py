@@ -70,7 +70,12 @@ class DecisionOutput(BaseModel):
             "e.g. ['trigger_immediate_alert']. Empty list if none were needed."
         ),
     )
-    final_urgency_assessment: Literal["Low", "Medium", "High", "Critical"] = Field(
+    # Lowercase, 3-level -- matches routing_by_risk_level_node's risk_level
+    # vocabulary exactly, so the graph never carries two differently-cased,
+    # differently-sized urgency scales side by side (see agent_graph.py's
+    # URGENCY_TO_RISK_LEVEL, which used to need to collapse a 4th "Critical"
+    # tier down to "high" -- that tier no longer exists at the source).
+    final_urgency_assessment: Literal["low", "medium", "high"] = Field(
         description="Final urgency level determined for this incident."
     )
     recommended_action: str = Field(description="Short description of the next routing step.")

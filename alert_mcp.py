@@ -25,8 +25,8 @@ def trigger_immediate_alert(incident_id: str, urgency_reason: str) -> str:
     Trigger an immediate human/Amazon Polly voice alert for a high-risk incident.
 
     Call this only when the situation requires urgent human intervention (e.g.
-    Critical or High urgency with an imminent safety risk) -- it pages a human
-    responder, so it should not be used for routine or Low/Medium urgency cases.
+    High urgency with an imminent safety risk) -- it pages a human
+    responder, so it should not be used for routine or low/medium urgency cases.
 
     Args:
         incident_id: Unique identifier of the incident being escalated.

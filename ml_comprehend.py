@@ -4,6 +4,8 @@ import torch
 from anthropic import AnthropicBedrock
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
 
+from local_storage import save_token_usage_record
+
 # השפות שבהן Amazon Comprehend תומך עבור detect_sentiment (עברית אינה ביניהן)
 COMPREHEND_SENTIMENT_LANGUAGES = {'en', 'es', 'fr', 'de', 'it', 'pt', 'ar', 'hi', 'ja', 'ko', 'zh', 'zh-TW'}
 HEBREW_UNICODE_RANGE = ('֐', '׿')
@@ -131,7 +133,7 @@ class DistressScreeningPipeline:
             print(f"[Language Detection Error] {e}")
         return 'unknown'
 
-    def _score_hebrew_distress(self, text: str) -> tuple[float, int]:
+    def _score_hebrew_distress(self, text: str, incident_id: str = "") -> tuple[float, int]:
         """
         מריץ HeBERT על טקסט עברי ומחזיר (distress_probability, מספר ה-chunks).
         טקסטים ארוכים (מעל ~500 טוקנים אמיתיים) מפוצלים ל-chunks חופפים כדי שלא
@@ -156,9 +158,20 @@ class DistressScreeningPipeline:
             chunk_distress_probability = scores_by_label.get('DISTRESS', scores_by_label.get('NEGATIVE', 0.0))
             distress_probability = max(distress_probability, chunk_distress_probability)
 
+        # HeBERT רץ מקומית (אין חיוב API), אבל עדיין "צריכת טוקנים" אמיתית של מודל -
+        # נספר כאן לפי הטוקנייזר של המודל עצמו, לא ניחוש. אין טוקני פלט (סיווג, לא ייצור טקסט).
+        save_token_usage_record(
+            pipeline_stage="ml_comprehend_hebert_screening",
+            model_id="HeBERT (local)",
+            sentence=text,
+            input_tokens=token_count,
+            output_tokens=0,
+            incident_id=incident_id,
+        )
+
         return distress_probability, len(text_chunks)
 
-    def _translate_text(self, text: str, target_language: str) -> str | None:
+    def _translate_text(self, text: str, target_language: str, incident_id: str = "") -> str | None:
         """
         מתרגם טקסט דרך Claude Haiku על Bedrock (אותו מודל/אזור שכבר מאומתים
         לעבודה בבדיקת ההזיות של decision_agent_graph.py). Fails safe: בכל
@@ -174,13 +187,21 @@ class DistressScreeningPipeline:
                        f"Return ONLY the translated text, with no explanation or preamble.",
                 messages=[{"role": "user", "content": text}],
             )
+            save_token_usage_record(
+                pipeline_stage="ml_comprehend_translation_crosscheck",
+                model_id=TRANSLATION_MODEL_ID,
+                sentence=text,
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+                incident_id=incident_id,
+            )
             block = next(b for b in response.content if b.type == "text")
             return block.text.strip()
         except Exception as e:
             print(f"[Translation Error] {e}")
             return None
 
-    def _cross_check_via_translation(self, text: str, source_language: str) -> dict | None:
+    def _cross_check_via_translation(self, text: str, source_language: str, incident_id: str = "") -> dict | None:
         """
         בדיקה חוצת-שפות (cross-lingual second opinion) לפוסט שלא עבר את הסף
         בבדיקה הראשונית: מתרגם אותו לשפה השנייה הנתמכת ומריץ שם סינון נוסף,
@@ -189,7 +210,7 @@ class DistressScreeningPipeline:
         (ראו analyze_post) - לעולם לא דורס פוסט שכבר הוסלם.
         """
         if source_language == 'he':
-            translated = self._translate_text(text, target_language='English')
+            translated = self._translate_text(text, target_language='English', incident_id=incident_id)
             if not translated:
                 return None
             try:
@@ -205,10 +226,10 @@ class DistressScreeningPipeline:
             }
 
         # source_language == 'en'
-        translated = self._translate_text(text, target_language='Hebrew')
+        translated = self._translate_text(text, target_language='Hebrew', incident_id=incident_id)
         if not translated:
             return None
-        distress_probability, num_chunks = self._score_hebrew_distress(translated)
+        distress_probability, num_chunks = self._score_hebrew_distress(translated, incident_id=incident_id)
         hebert_source = "HeBERT" if num_chunks == 1 else f"HeBERT({num_chunks} chunks)"
         return {
             "distress_probability": distress_probability,
@@ -216,7 +237,7 @@ class DistressScreeningPipeline:
             "translated_text": translated,
         }
 
-    def analyze_post(self, text: str) -> dict:
+    def analyze_post(self, text: str, incident_id: str = "") -> dict:
         """
         מריץ את תהליך הסינון על הטקסט ומחליט האם להעבירו להמשך הצינור (True/False).
         מנתב לפי שפה: עברית -> HeBERT מקומי, שפה נתמכת אחרת -> Comprehend,
@@ -228,7 +249,7 @@ class DistressScreeningPipeline:
         language = self.detect_language(text)
 
         if language == 'he':
-            distress_probability, num_chunks = self._score_hebrew_distress(text)
+            distress_probability, num_chunks = self._score_hebrew_distress(text, incident_id=incident_id)
             label = 'NEGATIVE' if distress_probability >= 0.5 else 'NEUTRAL'
             score = max(distress_probability, 1 - distress_probability)
             source = "HeBERT" if num_chunks == 1 else f"HeBERT({num_chunks} chunks)"
@@ -279,7 +300,7 @@ class DistressScreeningPipeline:
         # סופית שהפוסט תקין (recall-first, ראו הערה למעלה).
         cross_check = None
         if not passed_screening and language in ('he', 'en'):
-            cross_check = self._cross_check_via_translation(text, source_language=language)
+            cross_check = self._cross_check_via_translation(text, source_language=language, incident_id=incident_id)
             if cross_check and cross_check["distress_probability"] >= DISTRESS_THRESHOLD:
                 passed_screening = True
                 reason = (

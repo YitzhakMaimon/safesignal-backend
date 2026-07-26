@@ -58,7 +58,7 @@ from langgraph.prebuilt import ToolNode
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
-from local_storage import save_immediate_alert_record
+from local_storage import save_token_usage_record
 from schemas import AgentState, DecisionOutput
 
 ALERT_MCP_URL = os.environ.get("ALERT_MCP_URL", "http://localhost:8011/mcp")
@@ -79,6 +79,10 @@ MAX_OUTPUT_RETRIES = 3
 
 # --- Routing by risk level (n8n workflow, with a local fallback) ---
 ROUTING_WEBHOOK_URL = os.environ.get("ROUTING_WEBHOOK_URL", "http://localhost:5678/webhook/risk-routing")
+# "critical" can no longer come from final_urgency_assessment itself (schemas.py
+# now constrains it to low/medium/high), but _fallback_risk_level's other input,
+# state.distress_classification, is free text set by safesignal.py from whatever
+# the upstream classifier sent -- kept here defensively for that path only.
 URGENCY_TO_RISK_LEVEL = {"critical": "high", "high": "high", "medium": "medium", "low": "low"}
 
 # --- Terminal nodes ---
@@ -114,7 +118,7 @@ def build_mock_tools() -> list:
         """
         Trigger an immediate human/Amazon Polly voice alert for a high-risk incident.
         Call this only when the situation requires urgent human intervention (e.g.
-        Critical or High urgency with an imminent safety risk).
+        High urgency with an imminent safety risk).
 
         Args:
             incident_id: Unique identifier of the incident being escalated.
@@ -154,13 +158,34 @@ def _build_system_prompt(state: AgentState) -> str:
         f"Automated distress classification: {state.distress_classification}\n"
         f"Passive RAG context already retrieved: {state.initial_rag_context}\n\n"
         "Available tools:\n"
-        "- trigger_immediate_alert: use ONLY for Critical/High urgency situations that "
+        "- trigger_immediate_alert: use ONLY for High urgency situations that "
         "need immediate human/Amazon Polly voice intervention.\n"
         "- query_rag_history: use when this specific user's own historical incident "
         "pattern would materially change the urgency assessment and isn't already "
         "covered by the passive RAG context above.\n\n"
         "If no tool is needed, respond directly -- your final answer will be parsed "
         "into a structured assessment."
+    )
+
+
+def _log_gemini_usage(ai_message, state: AgentState, stage: str) -> None:
+    """
+    Gemini (via ChatGoogleGenerativeAI) reports usage on the AIMessage's
+    usage_metadata dict rather than a separate response object like the
+    Anthropic/Bedrock clients used elsewhere in this pipeline -- may be absent
+    entirely (e.g. mocked LLMs in tests), so this is a no-op rather than a
+    hard failure when it's missing.
+    """
+    usage = getattr(ai_message, "usage_metadata", None)
+    if not usage:
+        return
+    save_token_usage_record(
+        pipeline_stage=stage,
+        model_id=MODEL_NAME,
+        sentence=state.raw_input,
+        input_tokens=usage.get("input_tokens", 0),
+        output_tokens=usage.get("output_tokens", 0),
+        incident_id=state.incident_id,
     )
 
 
@@ -183,6 +208,7 @@ def make_decision_agent_node(llm: ChatGoogleGenerativeAI, tools: list):
         if not just_executed_tools:
             llm_with_tools = llm.bind_tools(tools)
             ai_message = llm_with_tools.invoke(history)
+            _log_gemini_usage(ai_message, state, stage="decision_agent_tool_check")
 
             if ai_message.tool_calls:
                 return {
@@ -192,8 +218,19 @@ def make_decision_agent_node(llm: ChatGoogleGenerativeAI, tools: list):
                     or "Determined that an external tool call is required before finalizing the assessment.",
                 }
 
-        structured_llm = llm.with_structured_output(DecisionOutput)
-        decision: DecisionOutput = structured_llm.invoke(history)
+        # include_raw=True so the underlying AIMessage (and its usage_metadata) survives
+        # alongside the parsed DecisionOutput -- with_structured_output() otherwise
+        # discards the raw message and there'd be no way to log this call's token usage.
+        structured_llm = llm.with_structured_output(DecisionOutput, include_raw=True)
+        structured_result = structured_llm.invoke(history)
+        _log_gemini_usage(structured_result["raw"], state, stage="decision_agent_structured_output")
+        if structured_result["parsed"] is None:
+            # include_raw=True swallows a parse failure into parsing_error instead of
+            # raising, unlike the plain with_structured_output() path this replaces --
+            # re-raise so a bad structured-output response still fails loudly here
+            # rather than as an opaque AttributeError below.
+            raise structured_result["parsing_error"]
+        decision: DecisionOutput = structured_result["parsed"]
 
         return {
             "messages": seed,
@@ -301,6 +338,7 @@ def _run_hallucination_check(
     raw_input: str = "",
     distress_classification: str = "",
     tools_triggered: list[str] | None = None,
+    incident_id: str = "",
 ) -> dict:
     """
     Uses Claude Haiku on Bedrock to compare the Decision Agent's final answer
@@ -339,6 +377,14 @@ def _run_hallucination_check(
             system=HALLUCINATION_SYSTEM_PROMPT,
             output_config={"format": {"type": "json_schema", "schema": HALLUCINATION_SCHEMA}},
             messages=[{"role": "user", "content": user_content}],
+        )
+        save_token_usage_record(
+            pipeline_stage="decision_agent_hallucination_check",
+            model_id=HALLUCINATION_MODEL_ID,
+            sentence=raw_input or agent_output,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+            incident_id=incident_id,
         )
         block = next(b for b in response.content if b.type == "text")
         parsed = json.loads(block.text)
@@ -379,6 +425,7 @@ def output_screening_node(state: AgentState) -> dict:
             state.raw_input,
             state.distress_classification,
             state.tools_triggered,
+            incident_id=state.incident_id,
         )
 
     passed = not guardrail_result["blocked"] and not hallucination_result["hallucination_detected"]
@@ -521,6 +568,15 @@ def immediate_alert_node(state: AgentState) -> dict:
                 "user_id": state.user_id,
                 "urgency_reason": state.summary_for_human_reviewer or state.thought_process,
                 "risk_level": state.risk_level,
+                # Entity/text fields the n8n "Immediate Alert Email (Gmail)"
+                # workflow's email template renders -- without these it can
+                # only show IDs and the urgency reason, not the actual
+                # message or identifying details a reviewer needs.
+                "raw_text": state.raw_input,
+                "names": state.names,
+                "addresses": state.addresses,
+                "ages": state.ages,
+                "phone_numbers": state.phone_numbers,
             },
             timeout=10,
         )
@@ -530,18 +586,9 @@ def immediate_alert_node(state: AgentState) -> dict:
         print(f"[Immediate Alert Error] could not reach alert webhook: {e}")
         alert_status = f"alert_failed: {e}"
 
-    # Until now this was the only terminal node with no persistent record --
-    # review_queue/incident_log both write to data/*.xlsx, but the highest-
-    # urgency cases only ever hit the console log above and vanished on
-    # restart. Same local-Excel pattern as the other two terminal nodes.
-    save_immediate_alert_record(
-        incident_id=state.incident_id,
-        user_id=state.user_id,
-        risk_level=state.risk_level,
-        alert_status=alert_status,
-        urgency_reason=state.summary_for_human_reviewer or state.thought_process,
-    )
-
+    # Persistence for this incident (including this alert_status) happens once,
+    # centrally, in safesignal.py's /api/v1/decision-agent handler after this
+    # graph's ainvoke() returns -- see _persist_and_broadcast_incident there.
     return {"recommended_action": alert_status}
 
 
@@ -575,63 +622,6 @@ def human_review_node(state: AgentState) -> dict:
         review_status = f"review_queue_unreachable: {e}"
 
     return {"recommended_action": review_status}
-
-
-INCIDENTS_TABLE_KEY = "incidents/incidents_table.xlsx"
-INCIDENTS_TABLE_SHEET = "Incidents"
-INCIDENTS_TABLE_COLUMNS = [
-    "timestamp", "incident_id", "user_id", "risk_level", "distress_classification",
-    "names", "addresses", "ages", "phone_numbers", "text_content",
-    "summary_for_human_reviewer", "recommended_action", "final_urgency_assessment",
-]
-
-
-def _append_incident_to_s3_table(bucket: str, record: dict) -> None:
-    """
-    Read-modify-write a single cumulative Excel workbook in S3 (one row per
-    incident, one file total) instead of one JSON object per incident -- so
-    the archive can be opened directly as a spreadsheet (2026-07-19 product
-    decision) rather than requiring each incident's object to be opened one
-    at a time. Downloads the existing workbook if present, appends a row,
-    re-uploads. Not safe under concurrent writers (read-modify-write, no
-    locking) -- same trade-off local_storage.py's _append_row already makes
-    for the local Excel tables; acceptable here because this app has no
-    concurrent traffic.
-    """
-    s3 = boto3.client("s3", region_name=BEDROCK_AWS_REGION)
-
-    try:
-        download_buffer = io.BytesIO()
-        s3.download_fileobj(bucket, INCIDENTS_TABLE_KEY, download_buffer)
-        download_buffer.seek(0)
-        wb = load_workbook(download_buffer)
-        ws = wb[INCIDENTS_TABLE_SHEET] if INCIDENTS_TABLE_SHEET in wb.sheetnames else wb.active
-    except (BotoCoreError, ClientError):
-        wb = Workbook()
-        ws = wb.active
-        ws.title = INCIDENTS_TABLE_SHEET
-        ws.append(INCIDENTS_TABLE_COLUMNS)
-
-    ws.append([
-        datetime.now().isoformat(timespec="seconds"),
-        record.get("incident_id", ""),
-        record.get("user_id", ""),
-        record.get("risk_level", ""),
-        record.get("distress_classification", ""),
-        ", ".join(record.get("names") or []),
-        ", ".join(record.get("addresses") or []),
-        ", ".join(str(a) for a in (record.get("ages") or [])),
-        ", ".join(record.get("phone_numbers") or []),
-        record.get("raw_input", ""),
-        record.get("summary_for_human_reviewer", ""),
-        record.get("recommended_action", ""),
-        record.get("final_urgency_assessment", ""),
-    ])
-
-    upload_buffer = io.BytesIO()
-    wb.save(upload_buffer)
-    upload_buffer.seek(0)
-    s3.upload_fileobj(upload_buffer, bucket, INCIDENTS_TABLE_KEY)
 
 
 RAW_LOG_KEY = "raw/raw_messages_log.xlsx"
@@ -744,39 +734,14 @@ def log_raw_message(user_id: str, incident_id: str, text_content: str, message_t
 
 def log_and_close_node(state: AgentState) -> dict:
     """
-    Low-risk end node: appends the incident to a single cumulative S3 Excel
-    table (the only place this incident gets persisted -- no RDS/Postgres
-    instance is provisioned for this project, and the earlier local Excel
-    fallback was deliberately removed 2026-07-19 in favor of one managed
-    file), then closes out the graph run. The S3 write is best-effort -- a
-    storage hiccup here must not turn an already-screened, genuinely
-    low-risk incident into an unhandled exception.
-
-    Deliberately includes identifying PII (names/addresses/ages/phone_numbers
-    from Relevant Information Extraction, plus the raw message text) in the
-    archived record -- an explicit product decision (2026-07-19) that every
-    incident the system identifies as distress must be fully documented,
-    overriding local_storage.py's separate, still-local-only PII policy for
-    the earlier Screened Records table. Revisit if this bucket's access
-    policy/encryption posture changes.
+    Low-risk end node: closes out the graph run. Persistence for this
+    incident (including PII -- names/addresses/ages/phone_numbers -- and the
+    raw message text) happens once, centrally, in safesignal.py's
+    /api/v1/decision-agent handler after this graph's ainvoke() returns -- see
+    _persist_and_broadcast_incident there. This node no longer archives to S3
+    itself (that was the only persistence this incident got before the DB
+    existed).
     """
-    record = state.model_dump(exclude={"messages"})
-
-    if S3_LOG_BUCKET:
-        try:
-            _append_incident_to_s3_table(S3_LOG_BUCKET, record)
-            print(
-                f"[Log & Close] incident={state.incident_id} appended to "
-                f"s3://{S3_LOG_BUCKET}/{INCIDENTS_TABLE_KEY}"
-            )
-        except (BotoCoreError, ClientError) as e:
-            print(f"[Log & Close] S3 archive failed for incident={state.incident_id}: {e}")
-    else:
-        print(
-            f"[Log & Close] SAFESIGNAL_S3_BUCKET not configured -- skipping S3 archive "
-            f"for incident={state.incident_id} (nothing else persists this incident)."
-        )
-
     return {"recommended_action": "logged_and_closed"}
 
 

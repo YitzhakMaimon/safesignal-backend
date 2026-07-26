@@ -40,7 +40,13 @@ services:
   output_screening:
     build: ./services/output_screening
     ports:
-      - "8005:8005"
+      # host port 8005 collides with a Windows-reserved dynamic port range on
+      # this machine (bind fails with an access-denied error, not a real
+      # conflict with another process) -- 18005 on the host side only;
+      # container still listens on 8005 internally, so
+      # langgraph_agent's OUTPUT_SCREENING_URL (http://output_screening:8005/...,
+      # container-to-container on the compose network) is unaffected.
+      - "18005:8005"
     env_file:
       - .env
     environment:

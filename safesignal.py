@@ -13,28 +13,63 @@ instead of relying on every hop blindly forwarding everything.
 """
 import asyncio
 import base64
+import math
 import os
 import uuid
 from contextlib import AsyncExitStack, asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from xml.sax.saxutils import escape as xml_escape
 
+import boto3
 import requests
-from fastapi import FastAPI, Request
+from botocore.exceptions import BotoCoreError, ClientError
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from groq import Groq
 from langchain_core.messages import HumanMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
+from sqlalchemy import asc, case, desc, func, literal_column, or_, select
+from twilio.base.exceptions import TwilioRestException
+from twilio.rest import Client as TwilioClient
 import uvicorn
 
 from ml_comprehend import DistressScreeningPipeline
 from info_extraction import RelevantInfoExtractor
-from distress_classification import BedrockDistressClassifier
+from distress_classification import BedrockDistressClassifier, CLASS_TO_CATEGORY_CODE
 from rag_retrieval import RAGContextRetriever
 from decision_agent_graph import create_decision_agent, log_raw_message
-from local_storage import (
-    save_screened_record,
-    save_review_queue_record,
-    save_error_record,
-    get_error_records,
+from local_storage import save_error_record, get_error_records, save_false_positive_record
+from database import get_session, init_db, upsert_stmt
+from models import ExtractedEntities, Incident, IngestionSettings
+from realtime import (
+    incident_new_payload,
+    incident_update_payload,
+    manager,
+    record_invocation,
+    serialize_history_row,
+    serialize_incident,
+    system_status_loop,
+    utc_iso,
 )
+from schemas import IncidentStatusUpdate, IngestionSettingsUpdate
+
+# Same AWS region every other Bedrock/Comprehend call in this project is
+# pinned to (see decision_agent_graph.py's BEDROCK_AWS_REGION) -- reusing the
+# env var name rather than inventing a separate SES-only one, since this
+# deployment only ever has credentials configured for one region at a time.
+SES_AWS_REGION = os.environ.get("BEDROCK_AWS_REGION", "us-east-1")
+# Both sender and recipient: this is the operator's own inbox, not a
+# distribution list, so one verified SES identity covers both directions.
+EMERGENCY_ALERT_EMAIL = os.environ.get("EMERGENCY_ALERT_EMAIL", "yitzhak.maimon1@gmail.com")
+
+# Twilio voice-call counterpart to the SES email above, same destination
+# (the operator's own phone, not a real emergency dispatcher). All four
+# unset (the default) means "not configured" -- calling is skipped, not
+# attempted with empty credentials.
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
+TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER")
+EMERGENCY_ALERT_PHONE_NUMBER = os.environ.get("EMERGENCY_ALERT_PHONE_NUMBER")
 
 distress_pipeline: DistressScreeningPipeline | None = None
 info_extractor: RelevantInfoExtractor | None = None
@@ -42,12 +77,17 @@ distress_classifier: BedrockDistressClassifier | None = None
 rag_retriever: RAGContextRetriever | None = None
 decision_graph = None  # compiled LangGraph Decision Agent; None if MCP servers are unreachable
 _mcp_exit_stack: AsyncExitStack | None = None
+_status_loop_task: asyncio.Task | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global distress_pipeline, info_extractor, distress_classifier, rag_retriever
-    global decision_graph, _mcp_exit_stack
+    global decision_graph, _mcp_exit_stack, _status_loop_task
+
+    await init_db()
+    _status_loop_task = asyncio.create_task(system_status_loop())
+
     distress_pipeline = DistressScreeningPipeline()
     info_extractor = RelevantInfoExtractor()
     info_extractor.warm_up()
@@ -80,10 +120,25 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    _status_loop_task.cancel()
     await _mcp_exit_stack.aclose()
 
 
 app = FastAPI(lifespan=lifespan)
+
+# n8n calls this backend server-to-server (not subject to CORS at all), but
+# the dashboard's GET /api/v1/incidents fetch() is a real cross-origin
+# browser request (dashboard on its own Next.js dev port, backend on :8000)
+# -- without this, the browser silently blocks the response before
+# JavaScript ever sees it, regardless of anything the endpoint itself
+# returns. Wildcard is fine here: local/demo project, no cookies or auth
+# headers involved, nothing credentialed to leak cross-origin.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 PLACEHOLDER_FIELDS = {
     "text_content": "בדיקה: אני מרגיש מאוד לבד ומיואש בזמן האחרון",
@@ -255,7 +310,7 @@ async def screening_input(req: Request):
     body = await req.json()
     real_text = body.get("text") or body.get("text_content") or PLACEHOLDER_FIELDS["text_content"]
     assert distress_pipeline is not None
-    result = distress_pipeline.analyze_post(real_text)
+    result = distress_pipeline.analyze_post(real_text, incident_id=body.get("incident_id", ""))
     return merged(
         body,
         passed=result["passed_screening"],
@@ -270,14 +325,7 @@ async def extract_info(req: Request):
     body = await req.json()
     text = body.get("text_content") or body.get("text") or PLACEHOLDER_FIELDS["text_content"]
     assert info_extractor is not None
-    extracted = info_extractor.extract(text)
-    save_screened_record(
-        text_content=text,
-        screening_reason=body.get("screening_reason", ""),
-        names=extracted["names"],
-        addresses=extracted["addresses"],
-        ages=extracted["ages"],
-    )
+    extracted = info_extractor.extract(text, incident_id=body.get("incident_id", ""))
     return merged(
         body,
         text_content=text,
@@ -293,7 +341,7 @@ async def classify_distress(req: Request):
     body = await req.json()
     text = body.get("text_content", "")
     assert distress_classifier is not None
-    result = distress_classifier.classify(text)
+    result = distress_classifier.classify(text, incident_id=body.get("incident_id", ""))
     return merged(
         body,
         **{"class": result["class"]},
@@ -340,27 +388,153 @@ async def rag_context(req: Request):
     }
 
 
+async def _persist_and_broadcast_incident(
+    *,
+    incident_id: str,
+    user_id: str,
+    platform: str,
+    raw_text: str,
+    risk_level: str,
+    summary: str,
+    thought_process: str,
+    recommended_action: str,
+    final_urgency_assessment: str,
+    distress_classification: str,
+    screening_passed: bool,
+    screening_reason: str,
+    screening_tags: list,
+    tools_triggered: list,
+    screening_logs: list,
+    names: list,
+    addresses: list,
+    ages: list,
+    phone_numbers: list,
+) -> None:
+    """
+    Upserts the now-complete incident (every decision_agent_graph.py terminal
+    node -- immediate_alert/human_review/log_and_close -- already ran inside
+    the ainvoke() call this is invoked after, so this is the one place a full
+    incident record exists) into the DB and broadcasts INCIDENT_NEW to every
+    connected dashboard operator. Upsert rather than plain insert because n8n
+    can retry the same incident_id; is_unread/status are deliberately left out
+    of the update set so a retry can't clobber an operator's in-progress
+    review back to "new"/unread.
+    """
+    content_fields = dict(
+        user_id=user_id,
+        platform=platform,
+        raw_text=raw_text,
+        risk_level=risk_level,
+        summary=summary,
+        thought_process=thought_process,
+        recommended_action=recommended_action,
+        final_urgency_assessment=final_urgency_assessment,
+        distress_classification=distress_classification,
+        screening_passed=screening_passed,
+        screening_reason=screening_reason,
+        screening_tags=screening_tags,
+        tools_triggered=tools_triggered,
+        screening_logs=screening_logs,
+        updated_at=datetime.now(timezone.utc),
+    )
+    entity_fields = dict(names=names, ages=ages, phone_numbers=phone_numbers, addresses=addresses)
+
+    async with get_session() as session:
+        await session.execute(
+            upsert_stmt(
+                Incident,
+                index_elements=["incident_id"],
+                values={"incident_id": incident_id, **content_fields},
+            )
+        )
+        await session.execute(
+            upsert_stmt(
+                ExtractedEntities,
+                index_elements=["incident_id"],
+                values={"incident_id": incident_id, **entity_fields},
+            )
+        )
+        await session.commit()
+
+        incident_row = await session.get(Incident, incident_id)
+        entities_row = await session.get(ExtractedEntities, incident_id)
+
+    record_invocation()
+    await manager.broadcast(incident_new_payload(incident_row, entities_row))
+
+
 @app.post("/api/v1/decision-agent")
 async def decision_agent(req: Request):
     body = await req.json()
+    text = body.get("text_content") or body.get("text") or PLACEHOLDER_FIELDS["text_content"]
+    incident_id = body.get("incident_id") or str(uuid.uuid4())
+    user_id = body.get("user_id", "anonymous")
+    platform = body.get("platform", "telegram")
+    names = body.get("names", [])
+    addresses = body.get("addresses", [])
+    ages = body.get("ages", [])
+    phone_numbers = body.get("phone_numbers", [])
 
     if decision_graph is None:
         classification = body.get("classification", body.get("class", "רגיל"))
-        return merged(body, decision=f"route_to_human_review ({classification})")
+        recommended_action = f"route_to_human_review ({classification})"
+        await _persist_and_broadcast_incident(
+            incident_id=incident_id,
+            user_id=user_id,
+            platform=platform,
+            raw_text=text,
+            risk_level=body.get("risk_level", "unknown"),
+            summary=PLACEHOLDER_FIELDS["summary"],
+            thought_process="",
+            recommended_action=recommended_action,
+            final_urgency_assessment="",
+            distress_classification=classification,
+            screening_passed=True,
+            screening_reason="",
+            screening_tags=[],
+            tools_triggered=[],
+            screening_logs=[],
+            names=names,
+            addresses=addresses,
+            ages=ages,
+            phone_numbers=phone_numbers,
+        )
+        return merged(body, decision=recommended_action)
 
-    text = body.get("text_content") or body.get("text") or PLACEHOLDER_FIELDS["text_content"]
     initial_state = {
         "raw_input": text,
-        "user_id": body.get("user_id", "anonymous"),
-        "incident_id": body.get("incident_id") or str(uuid.uuid4()),
+        "user_id": user_id,
+        "incident_id": incident_id,
         "distress_classification": body.get("class", body.get("risk_level", "unknown")),
         "initial_rag_context": body.get("context", ""),
-        "names": body.get("names", []),
-        "addresses": body.get("addresses", []),
-        "ages": body.get("ages", []),
-        "phone_numbers": body.get("phone_numbers", []),
+        "names": names,
+        "addresses": addresses,
+        "ages": ages,
+        "phone_numbers": phone_numbers,
     }
     result = await decision_graph.ainvoke(initial_state)
+
+    await _persist_and_broadcast_incident(
+        incident_id=incident_id,
+        user_id=user_id,
+        platform=platform,
+        raw_text=text,
+        risk_level=result.get("risk_level") or "unknown",
+        summary=result.get("summary_for_human_reviewer", ""),
+        thought_process=result.get("thought_process", ""),
+        recommended_action=result.get("recommended_action", ""),
+        final_urgency_assessment=result.get("final_urgency_assessment", ""),
+        distress_classification=initial_state["distress_classification"],
+        screening_passed=result.get("screening_passed", True),
+        screening_reason=result.get("screening_reason", ""),
+        screening_tags=result.get("screening_tags", []),
+        tools_triggered=result.get("tools_triggered", []),
+        screening_logs=result.get("screening_logs", []),
+        names=names,
+        addresses=addresses,
+        ages=ages,
+        phone_numbers=phone_numbers,
+    )
 
     return merged(
         body,
@@ -408,12 +582,16 @@ async def screening_output(req: Request):
     passed = not pii_entities and classifier_passed
     tags = [f"pii:{e['type']}" for e in pii_entities]
 
+    # Lowercase high/medium/low -- same vocabulary routing_by_risk_level_node
+    # and DecisionOutput.final_urgency_assessment use, so a consumer reading
+    # `risk_level` back doesn't see different casing depending on which
+    # endpoint produced it. PII detection is treated as the most severe case.
     if pii_entities:
-        risk_level = "Critical"
+        risk_level = "high"
     elif not classifier_passed:
-        risk_level = "Medium"
+        risk_level = "medium"
     else:
-        risk_level = "Low"
+        risk_level = "low"
 
     return merged(
         body,
@@ -429,19 +607,14 @@ async def screening_output(req: Request):
 @app.post("/api/v1/review-queue")
 async def review_queue(req: Request):
     """
-    יעד ה-Human Review בפועל: אין מופע Open WebUI אמיתי לדחוף אליו, אז זה נשמר
-    לתור מקומי (data/review_queue.xlsx) שדשבורד עתידי יוכל לקרוא ממנו.
+    יעד ה-Human Review בפועל: אין מופע Open WebUI אמיתי לדחוף אליו. Called by
+    decision_agent_graph.py's human_review_node *during* the same ainvoke()
+    that /api/v1/decision-agent's own persistence call runs after -- so this
+    endpoint no longer writes its own record (that would race the not-yet-
+    existing DB row); /api/v1/decision-agent's _persist_and_broadcast_incident
+    is the single write site for every risk tier.
     """
     body = await req.json()
-    screening_logs = body.get("screening_logs") or []
-    last_screening_reason = screening_logs[-1].get("hallucination_check", {}).get("reason", "") if screening_logs else ""
-    save_review_queue_record(
-        incident_id=body.get("incident_id", ""),
-        user_id=body.get("user_id", "anonymous"),
-        risk_level=body.get("risk_level", ""),
-        summary_for_human_reviewer=body.get("summary_for_human_reviewer", ""),
-        screening_reason=last_screening_reason,
-    )
     return {"status": "queued", **body}
 
 
@@ -457,14 +630,19 @@ async def log_error(req: Request):
     יעד גנרי לדיווח שגיאות - למשל מ-n8n Error Workflow שרץ כשכשל execution
     (כגון Invoke Decision Agent (Backend) כשה-backend לא זמין). נשמר ב-
     data/error_log.xlsx כדי שמסך השגיאות העתידי ב-UI (GET /api/v1/errors)
-    יוכל להציג אותו למשתמש, במקום שהכשל ייבלע בשקט.
+    יוכל להציג אותו למשתמש, במקום שהכשל ייבלע בשקט. לא נשלח מייל על כך --
+    רק הרישום לקובץ.
     """
     body = await req.json()
+    source = body.get("source", "unknown")
+    error_message = body.get("error_message", "")
+    incident_id = body.get("incident_id", "")
+    user_id = body.get("user_id", "")
     save_error_record(
-        source=body.get("source", "unknown"),
-        error_message=body.get("error_message", ""),
-        incident_id=body.get("incident_id", ""),
-        user_id=body.get("user_id", ""),
+        source=source,
+        error_message=error_message,
+        incident_id=incident_id,
+        user_id=user_id,
     )
     return {"status": "logged"}
 
@@ -473,6 +651,433 @@ async def log_error(req: Request):
 async def list_errors():
     """מסך השגיאות העתידי ב-UI קורא מכאן - רשימת כל השגיאות שנרשמו ב-data/error_log.xlsx."""
     return {"errors": get_error_records()}
+
+
+@app.get("/api/v1/incidents")
+async def list_incidents(limit: int = 100):
+    """
+    History-fetch endpoint for the dashboard's initial load / page refresh --
+    the WebSocket (/api/v1/realtime) only ever pushes *new*/*updated*
+    incidents, it has no memory of anything that happened before a given
+    client connected. Without this, refreshing the page had nothing to
+    hydrate the feed from and always started blank.
+
+    incident_id + entities are always written together in the same
+    transaction (_persist_and_broadcast_incident upserts both), so an inner
+    join is safe -- there's no code path that creates one without the other.
+    """
+    limit = max(1, min(limit, 500))
+    async with get_session() as session:
+        result = await session.execute(
+            select(Incident, ExtractedEntities)
+            .join(ExtractedEntities, ExtractedEntities.incident_id == Incident.incident_id)
+            .order_by(Incident.created_at.desc())
+            .limit(limit)
+        )
+        rows = result.all()
+
+    return [serialize_incident(incident, entities) for incident, entities in rows]
+
+
+# Sorting "category" by the raw distress_classification column scatters rows
+# instead of grouping them: every raw label the classifier can produce that
+# ISN'T one of the three mapped ones (CLASS_TO_CATEGORY_CODE) -- "רגיל",
+# "unknown", etc -- sorts by its own distinct string instead of collapsing
+# into the single blank/no-badge group the CategoryBadge actually renders.
+# This CASE expression sorts by the same normalized code the frontend
+# displays, so every row with no badge shares one sort key and clusters
+# together instead of being interleaved with real categories.
+_CATEGORY_SORT_COLUMN = case(
+    *[(Incident.distress_classification == raw, code) for raw, code in CLASS_TO_CATEGORY_CODE.items()],
+    else_="",
+)
+
+# Column a `sortBy` value from the History screen's clickable headers maps to
+# -- kept as an explicit whitelist (rather than getattr(Incident, sortBy))
+# so an unrecognized/malicious sortBy value can never reach raw SQL, and
+# falls back to Incident.created_at below instead of erroring.
+_HISTORY_SORT_COLUMNS = {
+    "logId": literal_column("incidents.rowid"),
+    "timestamp": Incident.created_at,
+    "user": Incident.user_id,
+    "category": _CATEGORY_SORT_COLUMN,
+    "text": Incident.raw_text,
+    "status": Incident.status,
+}
+
+# English labels the History table's Category/Resolution badges actually
+# display (see safesignal-dashboard's CategoryBadge/ResolutionBadge) --
+# distress_classification is stored in Hebrew and status is an internal
+# code ("new", "false_positive", ...), so a plain ILIKE against those raw
+# columns would never match what a search for e.g. "suicide" or "escalated"
+# is really looking for. Global Search below OR's these in alongside the
+# raw-column ILIKE match.
+_CATEGORY_CODE_LABELS = {
+    "emotional_distress": "emotional distress",
+    "cyberbullying": "cyberbullying",
+    "suicide_emergency": "suicide emergency",
+}
+_RESOLUTION_LABELS = {
+    "new": "open",
+    "investigating": "investigating",
+    "escalated": "escalated",
+    "false_positive": "false positive",
+    "closed": "closed",
+}
+
+
+@app.get("/api/v1/incidents/history")
+async def list_incidents_history(
+    page: int = 1,
+    limit: int = 50,
+    search: str = "",
+    sortBy: str = "timestamp",
+    sortOrder: str = "desc",
+    startDate: str = "",
+    endDate: str = "",
+):
+    """
+    Server-side paginated/sorted/filtered feed for the Alert History screen --
+    unlike list_incidents() above (a fixed most-recent-N hydration fetch for
+    the live dashboard), every page/sort/filter here is computed in SQL via
+    LIMIT/OFFSET and WHERE, not fetched-then-sliced in Python: the frontend
+    never receives more than one page's worth of rows for any given request,
+    which is what keeps this correct as the incidents table grows past what
+    a single page load could reasonably hold.
+
+    log_id is SQLite's implicit rowid (see _HISTORY_SORT_COLUMNS) -- there is
+    no dedicated autoincrement column on Incident (its primary key is a
+    string incident_id), and rowid already gives every ordinary SQLite table
+    a stable, monotonically-increasing integer for free.
+    """
+    page = max(1, page)
+    limit = max(1, min(limit, 200))
+    sort_column = _HISTORY_SORT_COLUMNS.get(sortBy, Incident.created_at)
+    order = asc if sortOrder.lower() == "asc" else desc
+
+    filters = []
+    search = search.strip()
+    if search:
+        like = f"%{search}%"
+        search_lower = search.lower()
+        conditions = [
+            Incident.user_id.ilike(like),
+            Incident.raw_text.ilike(like),
+            Incident.distress_classification.ilike(like),
+            Incident.status.ilike(like),
+            Incident.incident_id.ilike(like),
+        ]
+
+        matching_hebrew_labels = [
+            hebrew_label
+            for hebrew_label, category_code in CLASS_TO_CATEGORY_CODE.items()
+            if search_lower in _CATEGORY_CODE_LABELS.get(category_code, "")
+        ]
+        if matching_hebrew_labels:
+            conditions.append(Incident.distress_classification.in_(matching_hebrew_labels))
+
+        matching_statuses = [
+            status for status, label in _RESOLUTION_LABELS.items() if search_lower in label
+        ]
+        if matching_statuses:
+            conditions.append(Incident.status.in_(matching_statuses))
+
+        filters.append(or_(*conditions))
+    if startDate:
+        start_dt = datetime.strptime(startDate, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        filters.append(Incident.created_at >= start_dt)
+    if endDate:
+        # Inclusive of the whole end day -- a date-only picker value with no
+        # time component would otherwise exclude every row from that day.
+        end_dt = datetime.strptime(endDate, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
+        filters.append(Incident.created_at < end_dt)
+
+    async with get_session() as session:
+        total = (
+            await session.execute(select(func.count()).select_from(Incident).where(*filters))
+        ).scalar_one()
+
+        result = await session.execute(
+            select(Incident, literal_column("incidents.rowid").label("log_id"))
+            .where(*filters)
+            .order_by(order(sort_column))
+            .limit(limit)
+            .offset((page - 1) * limit)
+        )
+        rows = result.all()
+
+    return {
+        "rows": [serialize_history_row(incident, log_id) for incident, log_id in rows],
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "totalPages": max(1, math.ceil(total / limit)),
+    }
+
+
+def _ingestion_settings_payload(settings: IngestionSettings) -> dict:
+    return {
+        "messageLimit": settings.message_limit,
+        "intervalMinutes": settings.interval_minutes,
+        "lastScanAt": utc_iso(settings.last_scan_at) if settings.last_scan_at else None,
+    }
+
+
+async def _get_or_create_ingestion_settings(session) -> IngestionSettings:
+    """Singleton row (id=1), auto-created with defaults on first-ever read --
+    the dashboard's settings panel and n8n's scan-check gate both need this
+    row to exist before either has explicitly written to it."""
+    settings = await session.get(IngestionSettings, 1)
+    if settings is None:
+        settings = IngestionSettings(id=1)
+        session.add(settings)
+        await session.commit()
+        await session.refresh(settings)
+    return settings
+
+
+@app.get("/api/v1/settings/scan")
+async def get_scan_settings():
+    """Dashboard's settings panel reads the current message_limit/interval_minutes from here."""
+    async with get_session() as session:
+        settings = await _get_or_create_ingestion_settings(session)
+        return _ingestion_settings_payload(settings)
+
+
+@app.put("/api/v1/settings/scan")
+async def update_scan_settings(update: IngestionSettingsUpdate):
+    """Dashboard's settings panel Save button writes new values here."""
+    async with get_session() as session:
+        settings = await _get_or_create_ingestion_settings(session)
+        settings.message_limit = update.message_limit
+        settings.interval_minutes = update.interval_minutes
+        await session.commit()
+        await session.refresh(settings)
+        return _ingestion_settings_payload(settings)
+
+
+@app.get("/api/v1/settings/scan-check")
+async def check_scan_due():
+    """
+    Gate n8n's new "Check Scan Due" node calls every minute (see the fixed
+    1-minute Schedule Trigger heartbeat) -- n8n Trigger nodes can't read
+    dynamic data from elsewhere in the workflow (confirmed by the existing
+    "Telegram Poll Config" node's own comment on why the message count lives
+    one node downstream of the trigger), so the *actual* configured interval
+    is enforced here instead: n8n's trigger fires every minute unconditionally,
+    but this endpoint only says "yes, go fetch Telegram" once per
+    interval_minutes, atomically claiming that slot by advancing
+    last_scan_at in the same request so two overlapping calls can't both
+    proceed for the same interval.
+    """
+    now = datetime.now(timezone.utc)
+    async with get_session() as session:
+        settings = await _get_or_create_ingestion_settings(session)
+
+        # Same SQLite-drops-tzinfo gotcha as Incident.created_at (see
+        # realtime.py's utc_iso) -- last_scan_at is always written as UTC,
+        # but SQLite hands back a naive datetime on read, which can't be
+        # compared directly against an aware `now`.
+        last_scan_at = settings.last_scan_at
+        if last_scan_at is not None and last_scan_at.tzinfo is None:
+            last_scan_at = last_scan_at.replace(tzinfo=timezone.utc)
+
+        due = (
+            last_scan_at is None
+            or now >= last_scan_at + timedelta(minutes=settings.interval_minutes)
+        )
+        if not due:
+            return {"should_scan": False}
+
+        settings.last_scan_at = now
+        await session.commit()
+        return {"should_scan": True, "messageLimit": settings.message_limit}
+
+
+@app.websocket("/api/v1/realtime")
+async def realtime(websocket: WebSocket):
+    """
+    Persistent WebSocket the dashboard connects to for live incident/system
+    frames (INCIDENT_NEW, INCIDENT_UPDATE, SYSTEM_STATUS_CHANGE). Supports any
+    number of concurrently connected operators -- every broadcast fans out to
+    all of them via realtime.py's ConnectionManager. The dashboard doesn't
+    send anything on this socket; we just block on receive_text() so we
+    notice a disconnect (raises WebSocketDisconnect) instead of busy-polling.
+    """
+    await manager.connect(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        manager.disconnect(websocket)
+
+
+def _send_escalation_email(incident: Incident, entities: ExtractedEntities | None) -> None:
+    """
+    Fires when an operator presses "Escalate to Authorities" in the dashboard
+    (PATCH .../status with status="escalated"). This is the manual-escalation
+    counterpart to decision_agent_graph.py's automatic immediate_alert_node --
+    that path currently posts to /api/v1/immediate-alert, which is still a
+    stub (see that endpoint), so today NO email goes out for either the
+    automatic high-risk path or a manual click; this wires up the manual one.
+
+    n8n.json already has a fully-configured "Send Emergency Email (AWS SES)"
+    node (id awsses-emergency-email, from/to yitzhak.maimon1@gmail.com) after
+    its "Immediate Alert" node, but that workflow is no longer in the live
+    execution path -- the dashboard talks to this backend directly, not to
+    n8n -- so that node never fires. Sending directly from here with the same
+    SES identity reuses the one thing from that dead path that was already
+    correct, instead of resurrecting a webhook hop through n8n.
+
+    Best-effort: a failed send must not block the status update/broadcast,
+    so failures are only logged loudly (same fail-open convention as
+    decision_agent_graph.py's immediate_alert_node).
+    """
+    names = ", ".join(entities.names) if entities and entities.names else "(אין שם)"
+    addresses = ", ".join(entities.addresses) if entities and entities.addresses else "(אין כתובת)"
+    ages = ", ".join(str(a) for a in entities.ages) if entities and entities.ages else "(אין גיל)"
+    phones = ", ".join(entities.phone_numbers) if entities and entities.phone_numbers else "(אין טלפון)"
+
+    rows = "".join(
+        f'<tr><td style="padding:6px 10px;border:1px solid #ccc;font-weight:bold;'
+        f'background:#f5f5f5;white-space:nowrap;">{label}</td>'
+        f'<td style="padding:6px 10px;border:1px solid #ccc;">{value}</td></tr>'
+        for label, value in [
+            ("Incident ID", incident.incident_id),
+            ("User ID", incident.user_id),
+            ("פלטפורמה", incident.platform),
+            ("רמת סיכון", incident.risk_level),
+            ("שם/שמות שזוהו", names),
+            ("כתובות שזוהו", addresses),
+            ("גיל", ages),
+            ("טלפון", phones),
+        ]
+    )
+    html_body = (
+        '<div dir="rtl" style="font-family:Arial,sans-serif;max-width:640px;margin:0 auto;">'
+        '<div style="background:#c0392b;color:#fff;padding:16px;text-align:center;'
+        'font-size:22px;font-weight:bold;border-radius:6px 6px 0 0;">'
+        "🚨 אירוע הועבר ידנית לטיפול הרשויות 🚨</div>"
+        '<div style="border:3px solid #c0392b;border-top:none;padding:16px;'
+        'border-radius:0 0 6px 6px;">'
+        '<p style="color:#c0392b;font-weight:bold;font-size:16px;">מפעיל המערכת סימן '
+        'אירוע זה כ"Escalate to Authorities":</p>'
+        f'<table style="width:100%;border-collapse:collapse;margin-bottom:16px;">{rows}</table>'
+        '<p style="font-weight:bold;">ציטוט ההודעה המקורית:</p>'
+        f'<blockquote style="background:#fdecea;border-right:4px solid #c0392b;'
+        f'margin:0;padding:10px 14px;font-size:15px;">{incident.raw_text}</blockquote>'
+        '<p style="font-weight:bold;margin-top:16px;">סיכום:</p>'
+        f"<p>{incident.summary}</p></div></div>"
+    )
+
+    try:
+        client = boto3.client("ses", region_name=SES_AWS_REGION)
+        client.send_email(
+            Source=EMERGENCY_ALERT_EMAIL,
+            Destination={"ToAddresses": [EMERGENCY_ALERT_EMAIL]},
+            Message={
+                "Subject": {
+                    "Data": f"🚨 SafeSignal - Incident {incident.incident_id} escalated to authorities",
+                    "Charset": "UTF-8",
+                },
+                "Body": {"Html": {"Data": html_body, "Charset": "UTF-8"}},
+            },
+        )
+    except (BotoCoreError, ClientError) as e:
+        print(f"[Escalate Email Error] could not send SES email for incident '{incident.incident_id}': {e}")
+
+
+def _place_escalation_call(incident: Incident, entities: ExtractedEntities | None) -> None:
+    """
+    Twilio counterpart to _send_escalation_email -- same trigger (operator
+    clicks "Escalate to Authorities") and same destination (the operator's
+    own phone, EMERGENCY_ALERT_PHONE_NUMBER -- not a real emergency
+    dispatcher; the operator is who decides whether to actually contact
+    authorities, exactly like the email).
+
+    Uses Twilio's inline `twiml=` param (a literal TwiML document handed
+    straight to the API) instead of pointing Twilio at a webhook URL that
+    returns TwiML -- this backend runs locally with no public inbound
+    address for Twilio to fetch from.
+
+    Best-effort / fail-open, same convention as _send_escalation_email: skips
+    entirely (logged, not silent) if Twilio isn't configured, and a failed
+    call must not block the status update/broadcast.
+    """
+    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_FROM_NUMBER and EMERGENCY_ALERT_PHONE_NUMBER):
+        print(
+            "[Escalate Call] Twilio not configured (TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / "
+            "TWILIO_FROM_NUMBER / EMERGENCY_ALERT_PHONE_NUMBER) -- skipping call."
+        )
+        return
+
+    names = ", ".join(entities.names) if entities and entities.names else "לא זוהה שם"
+    addresses = ", ".join(entities.addresses) if entities and entities.addresses else "לא זוהתה כתובת"
+
+    # Read twice -- a phone call has no screen to re-read from, so the one
+    # chance to catch the incident ID/address is a second pass.
+    spoken_message = (
+        f"התראת חירום ממערכת סייף סיגנל. מספר תיק {incident.incident_id}. "
+        f"רמת סיכון: {incident.risk_level}. שם שזוהה: {names}. "
+        f"כתובת שזוהתה: {addresses}. סיכום: {incident.summary}. "
+        f"חוזר על הפרטים. מספר תיק {incident.incident_id}. "
+        f"רמת סיכון: {incident.risk_level}. שם שזוהה: {names}. "
+        f"כתובת שזוהתה: {addresses}."
+    )
+    twiml = f'<Response><Say language="he-IL">{xml_escape(spoken_message)}</Say></Response>'
+
+    try:
+        client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        client.calls.create(to=EMERGENCY_ALERT_PHONE_NUMBER, from_=TWILIO_FROM_NUMBER, twiml=twiml)
+    except TwilioRestException as e:
+        print(f"[Escalate Call Error] could not place Twilio call for incident '{incident.incident_id}': {e}")
+
+
+@app.patch("/api/v1/incidents/{incident_id}/status")
+async def update_incident_status(incident_id: str, update: IncidentStatusUpdate):
+    """
+    Dashboard action-bar endpoint (Acknowledge/Escalate/False Positive/Close).
+    Updates the DB row and broadcasts INCIDENT_UPDATE so every connected
+    operator's view stays in sync. status="false_positive" also appends a
+    row to data/false_positive_log.xlsx (see save_false_positive_record) --
+    a local record of the incident_id/raw_text/classification an operator
+    overrode, for later model review.
+    """
+    changes: dict = {"status": update.status}
+    if update.is_unread is not None:
+        changes["isUnread"] = update.is_unread
+
+    async with get_session() as session:
+        incident = await session.get(Incident, incident_id)
+        if incident is None:
+            raise HTTPException(status_code=404, detail=f"incident '{incident_id}' not found")
+
+        incident.status = update.status
+        if update.is_unread is not None:
+            incident.is_unread = update.is_unread
+        incident.updated_at = datetime.now(timezone.utc)
+
+        if update.status == "escalated":
+            entities = await session.get(ExtractedEntities, incident_id)
+            _send_escalation_email(incident, entities)
+            _place_escalation_call(incident, entities)
+        elif update.status == "false_positive":
+            save_false_positive_record(
+                incident_id=incident.incident_id,
+                user_id=incident.user_id,
+                platform=incident.platform,
+                raw_text=incident.raw_text,
+                risk_level=incident.risk_level,
+                distress_classification=incident.distress_classification,
+                summary=incident.summary,
+            )
+
+        await session.commit()
+
+    await manager.broadcast(incident_update_payload(incident_id, changes))
+    return {"incidentId": incident_id, "changes": changes}
 
 
 if __name__ == "__main__":
