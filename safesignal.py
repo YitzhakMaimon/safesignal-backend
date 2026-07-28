@@ -16,6 +16,7 @@ import base64
 import math
 import os
 import uuid
+from calendar import monthrange
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from xml.sax.saxutils import escape as xml_escape
@@ -38,9 +39,15 @@ from info_extraction import RelevantInfoExtractor
 from distress_classification import BedrockDistressClassifier, CLASS_TO_CATEGORY_CODE
 from rag_retrieval import RAGContextRetriever
 from decision_agent_graph import create_decision_agent, log_raw_message
-from local_storage import save_error_record, get_error_records, save_false_positive_record
+from local_storage import (
+    save_error_record,
+    get_error_records,
+    save_false_positive_record,
+    save_token_usage_record,
+    get_total_tokens_for_sentence,
+)
 from database import get_session, init_db, upsert_stmt
-from models import ExtractedEntities, Incident, IngestionSettings
+from models import ExtractedEntities, Incident
 from realtime import (
     incident_new_payload,
     incident_update_payload,
@@ -51,7 +58,7 @@ from realtime import (
     system_status_loop,
     utc_iso,
 )
-from schemas import IncidentStatusUpdate, IngestionSettingsUpdate
+from schemas import IncidentStatusUpdate
 
 # Same AWS region every other Bedrock/Comprehend call in this project is
 # pinned to (see decision_agent_graph.py's BEDROCK_AWS_REGION) -- reusing the
@@ -166,6 +173,11 @@ def _transcribe_audio(audio_url: str) -> str:
     GROQ_API_KEY configured, no audio_url provided, the URL isn't fetchable,
     or the Groq API call itself fails) so a transcription hiccup degrades to
     the old stub behavior instead of crashing the whole ingestion pipeline.
+
+    Deliberately NOT logged via save_token_usage_record: Whisper is billed by
+    audio duration, not tokens, and groq.types.audio.transcription.Transcription
+    carries only `text` -- no usage/token field exists to report here, unlike
+    _analyze_image's Gemini call just below.
     """
     if not GROQ_API_KEY or not audio_url:
         return PLACEHOLDER_FIELDS["TranscriptionText"]
@@ -199,7 +211,7 @@ VISION_PROMPT = """את/ה כלי סינון במערכת טריאז' מצוקה
 אל תמציא/י תוכן שאינו נראה בתמונה בפועל."""
 
 
-def _analyze_image(image_url: str) -> str:
+def _analyze_image(image_url: str, incident_id: str = "") -> str:
     """
     Real vision analysis via Gemini (multimodal): OCRs any text visible in the
     image and separately flags visual distress signals the text alone wouldn't
@@ -208,6 +220,13 @@ def _analyze_image(image_url: str) -> str:
     Fails *open* to the stub placeholder text on any error, same convention as
     _transcribe_audio -- a vision hiccup degrades gracefully instead of crashing
     the ingestion pipeline.
+
+    This is n8n's very first model call (Image Analysis, right after Route by
+    Detected Content) -- logged under save_token_usage_record's
+    "vision_gemini_analysis" stage, matched to the incident by incident_id
+    rather than by sentence, since the sentence this stage produces
+    (the OCR'd/described text) isn't necessarily the same string later stages
+    log token usage against once it's merged with other sources.
     """
     if not GOOGLE_API_KEY or not image_url:
         return PLACEHOLDER_FIELDS["DetectedText"]
@@ -224,6 +243,17 @@ def _analyze_image(image_url: str) -> str:
             {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_image}"}},
         ])
         response = llm.invoke([message])
+
+        usage = getattr(response, "usage_metadata", None)
+        if usage:
+            save_token_usage_record(
+                pipeline_stage="vision_gemini_analysis",
+                model_id=GEMINI_VISION_MODEL,
+                sentence=response.content,
+                input_tokens=usage.get("input_tokens", 0),
+                output_tokens=usage.get("output_tokens", 0),
+                incident_id=incident_id,
+            )
         return response.content
     except Exception as e:
         print(f"[Gemini Vision Error] {e}")
@@ -276,7 +306,7 @@ def _ml_output_classifier(text: str) -> tuple[bool, str]:
 @app.post("/api/v1/vision/textract-rekognition")
 async def vision(req: Request):
     body = await req.json()
-    detected_text = _analyze_image(body.get("image_url", ""))
+    detected_text = _analyze_image(body.get("image_url", ""), incident_id=body.get("incident_id", ""))
     return merged(body, DetectedText=detected_text)
 
 
@@ -409,6 +439,8 @@ async def _persist_and_broadcast_incident(
     addresses: list,
     ages: list,
     phone_numbers: list,
+    tokens_used: int | None = None,
+    confidence_score: float | None = None,
 ) -> None:
     """
     Upserts the now-complete incident (every decision_agent_graph.py terminal
@@ -435,6 +467,8 @@ async def _persist_and_broadcast_incident(
         screening_tags=screening_tags,
         tools_triggered=tools_triggered,
         screening_logs=screening_logs,
+        tokens_used=tokens_used,
+        confidence_score=confidence_score,
         updated_at=datetime.now(timezone.utc),
     )
     entity_fields = dict(names=names, ages=ages, phone_numbers=phone_numbers, addresses=addresses)
@@ -498,6 +532,8 @@ async def decision_agent(req: Request):
             addresses=addresses,
             ages=ages,
             phone_numbers=phone_numbers,
+            tokens_used=get_total_tokens_for_sentence(text, incident_id=incident_id),
+            confidence_score=None,
         )
         return merged(body, decision=recommended_action)
 
@@ -534,6 +570,8 @@ async def decision_agent(req: Request):
         addresses=addresses,
         ages=ages,
         phone_numbers=phone_numbers,
+        tokens_used=get_total_tokens_for_sentence(text, incident_id=incident_id),
+        confidence_score=result.get("confidence_score"),
     )
 
     return merged(
@@ -543,6 +581,7 @@ async def decision_agent(req: Request):
         final_urgency_assessment=result.get("final_urgency_assessment", ""),
         recommended_action=result.get("recommended_action", ""),
         summary_for_human_reviewer=result.get("summary_for_human_reviewer", ""),
+        confidence_score=result.get("confidence_score"),
         # Set by output_screening_node / routing_by_risk_level_node, which now run
         # as part of the same graph (Bedrock Guardrails + Claude Haiku hallucination
         # check, then risk-level routing to immediate_alert/human_review/log_and_close).
@@ -703,6 +742,8 @@ _HISTORY_SORT_COLUMNS = {
     "category": _CATEGORY_SORT_COLUMN,
     "text": Incident.raw_text,
     "status": Incident.status,
+    "tokens": Incident.tokens_used,
+    "score": Incident.confidence_score,
 }
 
 # English labels the History table's Category/Resolution badges actually
@@ -726,35 +767,13 @@ _RESOLUTION_LABELS = {
 }
 
 
-@app.get("/api/v1/incidents/history")
-async def list_incidents_history(
-    page: int = 1,
-    limit: int = 50,
-    search: str = "",
-    sortBy: str = "timestamp",
-    sortOrder: str = "desc",
-    startDate: str = "",
-    endDate: str = "",
-):
+def _build_history_filters(search: str, startDate: str, endDate: str) -> list:
     """
-    Server-side paginated/sorted/filtered feed for the Alert History screen --
-    unlike list_incidents() above (a fixed most-recent-N hydration fetch for
-    the live dashboard), every page/sort/filter here is computed in SQL via
-    LIMIT/OFFSET and WHERE, not fetched-then-sliced in Python: the frontend
-    never receives more than one page's worth of rows for any given request,
-    which is what keeps this correct as the incidents table grows past what
-    a single page load could reasonably hold.
-
-    log_id is SQLite's implicit rowid (see _HISTORY_SORT_COLUMNS) -- there is
-    no dedicated autoincrement column on Incident (its primary key is a
-    string incident_id), and rowid already gives every ordinary SQLite table
-    a stable, monotonically-increasing integer for free.
+    Shared WHERE-clause builder for both the paginated History table
+    (list_incidents_history) and its aggregate-stats counterpart
+    (get_incidents_history_stats) -- factored out so the two endpoints can
+    never drift apart on what "the same search/date filters" actually means.
     """
-    page = max(1, page)
-    limit = max(1, min(limit, 200))
-    sort_column = _HISTORY_SORT_COLUMNS.get(sortBy, Incident.created_at)
-    order = asc if sortOrder.lower() == "asc" else desc
-
     filters = []
     search = search.strip()
     if search:
@@ -791,6 +810,44 @@ async def list_incidents_history(
         # time component would otherwise exclude every row from that day.
         end_dt = datetime.strptime(endDate, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
         filters.append(Incident.created_at < end_dt)
+    return filters
+
+
+@app.get("/api/v1/incidents/history")
+async def list_incidents_history(
+    page: int = 1,
+    limit: int = 50,
+    search: str = "",
+    sortBy: str = "timestamp",
+    sortOrder: str = "desc",
+    startDate: str = "",
+    endDate: str = "",
+):
+    """
+    Server-side paginated/sorted/filtered feed for the Alert History screen --
+    unlike list_incidents() above (a fixed most-recent-N hydration fetch for
+    the live dashboard), every page/sort/filter here is computed in SQL via
+    LIMIT/OFFSET and WHERE, not fetched-then-sliced in Python: the frontend
+    never receives more than one page's worth of rows for any given request,
+    which is what keeps this correct as the incidents table grows past what
+    a single page load could reasonably hold.
+
+    This endpoint is deliberately NOT what feeds the charts above the History
+    table -- see get_incidents_history_stats for that. Fetching every row
+    through this one with a huge `limit` would work today but silently
+    undercounts the moment the table grows past this endpoint's own 200 cap.
+
+    log_id is SQLite's implicit rowid (see _HISTORY_SORT_COLUMNS) -- there is
+    no dedicated autoincrement column on Incident (its primary key is a
+    string incident_id), and rowid already gives every ordinary SQLite table
+    a stable, monotonically-increasing integer for free.
+    """
+    page = max(1, page)
+    limit = max(1, min(limit, 200))
+    sort_column = _HISTORY_SORT_COLUMNS.get(sortBy, Incident.created_at)
+    order = asc if sortOrder.lower() == "asc" else desc
+
+    filters = _build_history_filters(search, startDate, endDate)
 
     async with get_session() as session:
         total = (
@@ -815,83 +872,178 @@ async def list_incidents_history(
     }
 
 
-def _ingestion_settings_payload(settings: IngestionSettings) -> dict:
-    return {
-        "messageLimit": settings.message_limit,
-        "intervalMinutes": settings.interval_minutes,
-        "lastScanAt": utc_iso(settings.last_scan_at) if settings.last_scan_at else None,
-    }
-
-
-async def _get_or_create_ingestion_settings(session) -> IngestionSettings:
-    """Singleton row (id=1), auto-created with defaults on first-ever read --
-    the dashboard's settings panel and n8n's scan-check gate both need this
-    row to exist before either has explicitly written to it."""
-    settings = await session.get(IngestionSettings, 1)
-    if settings is None:
-        settings = IngestionSettings(id=1)
-        session.add(settings)
-        await session.commit()
-        await session.refresh(settings)
-    return settings
-
-
-@app.get("/api/v1/settings/scan")
-async def get_scan_settings():
-    """Dashboard's settings panel reads the current message_limit/interval_minutes from here."""
-    async with get_session() as session:
-        settings = await _get_or_create_ingestion_settings(session)
-        return _ingestion_settings_payload(settings)
-
-
-@app.put("/api/v1/settings/scan")
-async def update_scan_settings(update: IngestionSettingsUpdate):
-    """Dashboard's settings panel Save button writes new values here."""
-    async with get_session() as session:
-        settings = await _get_or_create_ingestion_settings(session)
-        settings.message_limit = update.message_limit
-        settings.interval_minutes = update.interval_minutes
-        await session.commit()
-        await session.refresh(settings)
-        return _ingestion_settings_payload(settings)
-
-
-@app.get("/api/v1/settings/scan-check")
-async def check_scan_due():
+@app.get("/api/v1/incidents/history/stats")
+async def get_incidents_history_stats(
+    search: str = "",
+    startDate: str = "",
+    endDate: str = "",
+):
     """
-    Gate n8n's new "Check Scan Due" node calls every minute (see the fixed
-    1-minute Schedule Trigger heartbeat) -- n8n Trigger nodes can't read
-    dynamic data from elsewhere in the workflow (confirmed by the existing
-    "Telegram Poll Config" node's own comment on why the message count lives
-    one node downstream of the trigger), so the *actual* configured interval
-    is enforced here instead: n8n's trigger fires every minute unconditionally,
-    but this endpoint only says "yes, go fetch Telegram" once per
-    interval_minutes, atomically claiming that slot by advancing
-    last_scan_at in the same request so two overlapping calls can't both
-    proceed for the same interval.
+    Aggregate counts for the charts above the Alert History table (category
+    mix, severity mix, monthly trend, one month's call-density heatmap,
+    handled/total) -- every number here is a COUNT/GROUP BY over every row
+    matching the filters, computed in SQLite, not fetched-then-counted in
+    the browser. That's the difference from list_incidents_history: this
+    endpoint has no page/limit/sort of its own and stays correct regardless
+    of how large the incidents table grows, whereas paging through that one
+    with an oversized `limit` would silently stop counting past its 200 cap.
+
+    Shares search/date filters with the History table (_build_history_filters)
+    so narrowing those narrows the charts too -- but has nothing analogous to
+    the table's `page`, since narrowing *that* is pagination, not scope.
     """
-    now = datetime.now(timezone.utc)
+    filters = _build_history_filters(search, startDate, endDate)
+
     async with get_session() as session:
-        settings = await _get_or_create_ingestion_settings(session)
+        total = (
+            await session.execute(select(func.count()).select_from(Incident).where(*filters))
+        ).scalar_one()
 
-        # Same SQLite-drops-tzinfo gotcha as Incident.created_at (see
-        # realtime.py's utc_iso) -- last_scan_at is always written as UTC,
-        # but SQLite hands back a naive datetime on read, which can't be
-        # compared directly against an aware `now`.
-        last_scan_at = settings.last_scan_at
-        if last_scan_at is not None and last_scan_at.tzinfo is None:
-            last_scan_at = last_scan_at.replace(tzinfo=timezone.utc)
+        # "Handled" = any status other than "new" -- clicking Acknowledge
+        # (-> "investigating") is itself the operator's closing action on an
+        # incident from the History screen's point of view, not a
+        # still-in-progress state (product decision: Acknowledge marks the
+        # case as handled). "Active Open Cases" on the main screen answers a
+        # different question -- "how many cards are still in my personal
+        # feed" -- and deliberately also excludes locally-hidden
+        # acknowledged incidents, which this DB-level count has no way to
+        # see; the two panels are allowed to disagree by design.
+        handled_total = (
+            await session.execute(
+                select(func.count())
+                .select_from(Incident)
+                .where(*filters, Incident.status != "new")
+            )
+        ).scalar_one()
 
-        due = (
-            last_scan_at is None
-            or now >= last_scan_at + timedelta(minutes=settings.interval_minutes)
+        category_rows = (
+            await session.execute(
+                select(Incident.distress_classification, func.count())
+                .where(*filters)
+                .group_by(Incident.distress_classification)
+            )
+        ).all()
+
+        severity_rows = (
+            await session.execute(
+                select(Incident.risk_level, func.count())
+                .where(*filters)
+                .group_by(Incident.risk_level)
+            )
+        ).all()
+
+        month_key = func.strftime("%Y-%m", Incident.created_at)
+        monthly_category_rows = (
+            await session.execute(
+                select(month_key.label("month_key"), Incident.distress_classification, func.count())
+                .where(*filters)
+                .group_by("month_key", Incident.distress_classification)
+            )
+        ).all()
+
+        monthly_total_rows = (
+            await session.execute(
+                select(month_key.label("month_key"), func.count())
+                .where(*filters)
+                .group_by("month_key")
+            )
+        ).all()
+
+    # "Other" absorbs both the classifier's non-distress label ("רגיל") and
+    # any raw label CLASS_TO_CATEGORY_CODE doesn't recognize -- same rule
+    # serialize_history_row's category_code_for uses for the table.
+    category_counts = {"suicide_emergency": 0, "cyberbullying": 0, "emotional_distress": 0, "other": 0}
+    for raw_label, count in category_rows:
+        category_counts[CLASS_TO_CATEGORY_CODE.get(raw_label, "other")] += count
+
+    # Only high/medium/low ever reach the Severity Level chart -- a row
+    # whose risk_level is still "unknown" (or the reserved "critical" tier,
+    # see the frontend's RiskLevel comment) hasn't been triaged to a severity
+    # yet and is excluded rather than guessed at.
+    severity_counts = {"high": 0, "medium": 0, "low": 0}
+    for level, count in severity_rows:
+        if level in severity_counts:
+            severity_counts[level] += count
+
+    monthly_by_key: dict[str, dict[str, int]] = {}
+    for month_key_value, raw_label, count in monthly_category_rows:
+        code = CLASS_TO_CATEGORY_CODE.get(raw_label)
+        if code is None:
+            continue
+        bucket = monthly_by_key.setdefault(
+            month_key_value, {"emotional_distress": 0, "cyberbullying": 0, "suicide_emergency": 0}
         )
-        if not due:
-            return {"should_scan": False}
+        bucket[code] += count
+    monthly_trends = [
+        {"month": datetime.strptime(key, "%Y-%m").strftime("%b"), **counts}
+        for key, counts in sorted(monthly_by_key.items())
+    ]
 
-        settings.last_scan_at = now
-        await session.commit()
-        return {"should_scan": True, "messageLimit": settings.message_limit}
+    # Calendar heatmap covers a continuous 6-month strip (GitHub-contributions
+    # style) ending on whichever month had the most matching rows -- mirrors
+    # the frontend's old client-side heuristic (usually the most recent
+    # active month, since the table defaults to timestamp desc) while still
+    # surfacing the five months before it instead of just one.
+    month_totals = {key: count for key, count in monthly_total_rows}
+    top_month_key = max(month_totals, key=month_totals.get) if month_totals else None
+
+    if top_month_key:
+        end_year, end_month = (int(part) for part in top_month_key.split("-"))
+    else:
+        now = datetime.now(timezone.utc)
+        end_year, end_month = now.year, now.month
+
+    # 5 months before end_month, wrapping year boundaries.
+    start_ordinal = end_year * 12 + (end_month - 1) - 5
+    start_year, start_month = divmod(start_ordinal, 12)
+    start_month += 1
+
+    range_start = datetime(start_year, start_month, 1)
+    range_end = datetime(end_year, end_month, monthrange(end_year, end_month)[1])
+
+    async with get_session() as session:
+        day_key = func.strftime("%Y-%m-%d", Incident.created_at)
+        day_rows = (
+            await session.execute(
+                select(day_key.label("day"), func.count())
+                .where(
+                    *filters,
+                    day_key >= range_start.strftime("%Y-%m-%d"),
+                    day_key <= range_end.strftime("%Y-%m-%d"),
+                )
+                .group_by("day")
+            )
+        ).all()
+    day_counts = {day: count for day, count in day_rows}
+
+    heatmap_cells = []
+    cursor = range_start
+    while cursor <= range_end:
+        iso_date = cursor.strftime("%Y-%m-%d")
+        heatmap_cells.append(
+            {
+                "date": iso_date,
+                "day": cursor.day,
+                "month": cursor.month,
+                "year": cursor.year,
+                # Python's Monday=0 vs JS Date.getDay()'s Sunday=0 -- the
+                # frontend calendar grid groups by the JS convention, so
+                # convert here once rather than re-deriving it client-side.
+                "weekday": (cursor.weekday() + 1) % 7,
+                "count": day_counts.get(iso_date, 0),
+            }
+        )
+        cursor += timedelta(days=1)
+
+    return {
+        "total": total,
+        "handledTotal": handled_total,
+        "categoryCounts": category_counts,
+        "severityCounts": severity_counts,
+        "monthlyTrends": monthly_trends,
+        "heatmapRangeLabel": f"{range_start.strftime('%b %Y')} – {range_end.strftime('%b %Y')}",
+        "heatmapCells": heatmap_cells,
+    }
 
 
 @app.websocket("/api/v1/realtime")
@@ -1058,6 +1210,7 @@ async def update_incident_status(incident_id: str, update: IncidentStatusUpdate)
         if update.is_unread is not None:
             incident.is_unread = update.is_unread
         incident.updated_at = datetime.now(timezone.utc)
+        changes["updatedAt"] = utc_iso(incident.updated_at)
 
         if update.status == "escalated":
             entities = await session.get(ExtractedEntities, incident_id)

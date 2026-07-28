@@ -73,6 +73,7 @@ def serialize_incident(incident: Incident, entities: ExtractedEntities) -> dict:
         "platform": incident.platform,
         "rawText": incident.raw_text,
         "createdAt": utc_iso(incident.created_at),
+        "updatedAt": utc_iso(incident.updated_at),
         "riskLevel": incident.risk_level,
         "distressCategory": category_code_for(incident.distress_classification),
         "isUnread": incident.is_unread,
@@ -106,9 +107,10 @@ def serialize_history_row(incident: Incident, log_id: int) -> dict:
     Row shape for GET /api/v1/incidents/history -- the Alert History screen's
     server-side paginated/sorted/filtered table. Deliberately not
     serialize_incident's shape: that one feeds the live dashboard's full
-    Incident domain object, this returns exactly the six columns the History
-    table renders, pre-formatted for direct display (no client-side date
-    math or truncation needed).
+    Incident domain object, this returns the eight columns the History
+    table renders plus riskLevel (used by the Severity Level chart above the
+    table, not rendered as its own column), pre-formatted for direct display
+    (no client-side date math or truncation needed).
 
     log_id comes from SQLite's implicit rowid (see the /history query in
     safesignal.py) rather than a new schema column -- incident_id is a
@@ -122,6 +124,9 @@ def serialize_history_row(incident: Incident, log_id: int) -> dict:
         "category": category_code_for(incident.distress_classification),
         "detectedText": incident.raw_text,
         "resolution": incident.status,
+        "riskLevel": incident.risk_level,
+        "tokens": incident.tokens_used,
+        "confidenceScore": incident.confidence_score,
     }
 
 

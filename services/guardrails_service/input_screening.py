@@ -74,7 +74,9 @@ class DistressScreeningPipeline:
             "תודה על הכל", "סליחה מכולם", "בקרוב הכל ייגמר", "אין לי אוויר",
             "לא יכול יותר", "נמאס לי מהמשחק", "אני שקוף", "אין טעם",
             "השארתי לכם מכתב", "השארתי מכתב פרידה", "כתבתי מכתב פרידה",
-            "הלילה האחרון שלי", "הפעם האחרונה שלי", "היום האחרון שלי"
+            "הלילה האחרון שלי", "הפעם האחרונה שלי", "היום האחרון שלי",
+            "קופץ מהגג", "קופץ מהחלון", "קופץ מהקומה", "קופץ מהבניין",
+            "אני קופץ", "לקפוץ מלמעלה", "לקפוץ מהגג", "לקפוץ מהחלון",
         ]
 
         trigger_phrases_en = [
@@ -84,6 +86,8 @@ class DistressScreeningPipeline:
             "no point in living", "want to disappear", "better off without me",
             "thanks for everything", "sorry for everything", "said my goodbyes",
             "wrote a goodbye letter", "left a note",
+            "jumping off", "jumping from the roof", "jump off the roof",
+            "jump off the building", "going to jump", "about to jump",
         ]
 
         self.trigger_phrases = trigger_phrases_he + trigger_phrases_en

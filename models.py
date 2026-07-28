@@ -2,7 +2,7 @@
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -42,6 +42,27 @@ class Incident(Base):
     tools_triggered: Mapped[list[str]] = mapped_column(JSON, default=list)
     screening_logs: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
 
+    # Total tokens (input+output, summed across every model call site, from
+    # Image Analysis/Voice Transcription at n8n's entry through the Decision
+    # Agent's hallucination check at its exit) spent classifying this incident
+    # end-to-end -- read back from
+    # local_storage.get_total_tokens_for_sentence(raw_text, incident_id) once
+    # the decision graph finishes, since that's the same data
+    # data/tokens_log.xlsx already tracks per-incident for the token-usage
+    # audit trail. Nullable and defaults to None (not 0) -- an incident with
+    # no token record (e.g. logged before token tracking existed) has no
+    # known usage, which the History screen renders as a blank cell rather
+    # than a misleading "0 tokens used".
+    tokens_used: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+
+    # Decision Agent LLM's own confidence in final_urgency_assessment, 0.0-1.0
+    # (see DecisionOutput.confidence_score in schemas.py). Nullable/defaults to
+    # None, not 0.0 -- an incident whose graph run never reached the structured
+    # decision step (e.g. the decision_graph-unavailable stub path in
+    # safesignal.py) has no real score, which the History screen renders as a
+    # blank cell rather than a misleading "0%".
+    confidence_score: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
+
     entities: Mapped["ExtractedEntities"] = relationship(
         back_populates="incident", uselist=False, cascade="all, delete-orphan"
     )
@@ -59,23 +80,3 @@ class ExtractedEntities(Base):
     addresses: Mapped[list[str]] = mapped_column(JSON, default=list)
 
     incident: Mapped["Incident"] = relationship(back_populates="entities")
-
-
-class IngestionSettings(Base):
-    """
-    Singleton row (always id=1) holding the Telegram scan's configurable
-    message_limit/interval_minutes, plus last_scan_at -- the state
-    GET /api/v1/settings/scan-check reads/updates to enforce that interval
-    from outside n8n's own (static-only) Schedule Trigger. See safesignal.py's
-    scan-check endpoint for the gate logic this backs.
-    """
-
-    __tablename__ = "ingestion_settings"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
-    message_limit: Mapped[int] = mapped_column(Integer, default=10)
-    interval_minutes: Mapped[int] = mapped_column(Integer, default=20)
-    last_scan_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
-    )

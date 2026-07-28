@@ -62,7 +62,6 @@ from local_storage import save_token_usage_record
 from schemas import AgentState, DecisionOutput
 
 ALERT_MCP_URL = os.environ.get("ALERT_MCP_URL", "http://localhost:8011/mcp")
-RAG_MCP_URL = os.environ.get("RAG_MCP_URL", "http://localhost:8012/mcp")
 
 MODEL_NAME = os.environ.get("DECISION_AGENT_MODEL", "gemini-2.5-flash")
 
@@ -95,22 +94,108 @@ S3_LOG_BUCKET = os.environ.get("SAFESIGNAL_S3_BUCKET", "")
 
 
 async def load_all_mcp_tools(exit_stack: AsyncExitStack) -> list:
-    """Connects to both FastMCP servers and returns their combined tool list."""
+    """
+    Connects to the alert FastMCP server (trigger_immediate_alert) and adds the
+    locally-implemented query_rag_history tool (see _build_query_rag_history_tool)
+    on top -- that tool no longer proxies to rag_mcp.py/services/rag_service's
+    FAISS store, which has no per-user notion at all (see
+    _fetch_user_incident_history's docstring), so there's nothing left for it to
+    fetch over MCP here.
+    """
     tools = []
-    for url in (ALERT_MCP_URL, RAG_MCP_URL):
-        read, write, _ = await exit_stack.enter_async_context(streamablehttp_client(url))
-        session = await exit_stack.enter_async_context(ClientSession(read, write))
-        await session.initialize()
-        tools.extend(await load_mcp_tools(session))
+    read, write, _ = await exit_stack.enter_async_context(streamablehttp_client(ALERT_MCP_URL))
+    session = await exit_stack.enter_async_context(ClientSession(read, write))
+    await session.initialize()
+    tools.extend(await load_mcp_tools(session))
+    tools.append(_build_query_rag_history_tool())
     return tools
+
+
+async def _fetch_user_incident_history(user_id: str, limit: int = 5) -> list[dict]:
+    """
+    Fetches this specific user's own past incidents from the local incidents
+    store (data/safesignal.db -- the same DB the dashboard reads from),
+    filtered strictly by user_id, most recent first.
+
+    Replaces the previous query_rag_history implementation (rag_mcp.py ->
+    services/rag_service's FAISS index), whose vector store is a fixed corpus
+    of generic labelled training examples (see services/rag_service/rag_core.py)
+    with no user_id in its documents at all -- any user_id passed to it was
+    silently ignored, so every user's "history" lookup actually returned the
+    same shared, unpartitioned similar-examples results regardless of who was
+    asking. This queries the real per-incident record instead, which does
+    carry a user_id (see models.Incident), giving each Telegram sender (their
+    user_id is the permanent per-account telegram:<id>, see telegram_bridge.py)
+    their own isolated history rather than a mixed pool across everyone.
+    """
+    from sqlalchemy import select
+
+    from database import get_session
+    from models import Incident
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(Incident)
+            .where(Incident.user_id == user_id)
+            .order_by(Incident.created_at.desc())
+            .limit(limit)
+        )
+        incidents = result.scalars().all()
+
+    return [
+        {
+            "incident_id": incident.incident_id,
+            "created_at": incident.created_at.isoformat(),
+            "raw_text": incident.raw_text,
+            "distress_classification": incident.distress_classification,
+            "final_urgency_assessment": incident.final_urgency_assessment,
+        }
+        for incident in incidents
+    ]
+
+
+def _build_query_rag_history_tool():
+    """
+    Shared by both the real (load_all_mcp_tools) and mock (build_mock_tools)
+    tool lists -- unlike trigger_immediate_alert, this needs no external
+    service or network call to fake: it's a local DB read against the same
+    SQLite file the rest of this process already uses, so there's no
+    meaningful "mock" version of it left to write.
+    """
+
+    @lc_tool
+    async def query_rag_history(user_id: str, target_query: str) -> dict:
+        """
+        Fetch this specific user's own past incidents from SafeSignal's local
+        incident history, strictly filtered to this user_id -- not the general
+        knowledge base. Call this when the user's own history would materially
+        change the urgency assessment and isn't already covered by the passive
+        RAG context.
+
+        Args:
+            user_id: Identifier of the user whose history should be searched.
+            target_query: The specific question or topic being investigated --
+                kept for context in the returned payload; the lookup itself
+                always returns this user's own recent incidents, not a
+                semantic search over them.
+        """
+        history = await _fetch_user_incident_history(user_id)
+        return {
+            "user_id": user_id,
+            "target_query": target_query,
+            "history": history or [f"no past incidents found for user_id={user_id!r}"],
+        }
+
+    return query_rag_history
 
 
 def build_mock_tools() -> list:
     """
-    Local stand-ins for the two MCP tools, with no network I/O -- same names and
-    argument shapes as alert_mcp.py / rag_mcp.py, so the model's tool-calling decisions
-    are unaffected. Used when the MCP servers aren't reachable (e.g. local testing
-    without the two servers running, or a broken async MCP client environment).
+    Local stand-in for the alert MCP tool, with no network I/O -- same name and
+    argument shape as alert_mcp.py, so the model's tool-calling decisions are
+    unaffected. Used when the MCP server isn't reachable (e.g. local testing
+    without it running, or a broken async MCP client environment).
+    query_rag_history is real in both modes (see _build_query_rag_history_tool).
     """
 
     @lc_tool
@@ -126,25 +211,7 @@ def build_mock_tools() -> list:
         """
         return f"[MOCK] ALERT_SENT: simulated immediate alert for incident '{incident_id}' ({urgency_reason})."
 
-    @lc_tool
-    def query_rag_history(user_id: str, target_query: str) -> dict:
-        """
-        Fetch a specific user's historical distress patterns and past incident logs.
-        Call this when the user's own history -- not just similar cases from the
-        general knowledge base -- would materially change the urgency assessment.
-
-        Args:
-            user_id: Identifier of the user whose history should be searched.
-            target_query: The specific question or topic to search the user's history for.
-        """
-        return {
-            "mock": True,
-            "user_id": user_id,
-            "target_query": target_query,
-            "history": ["[MOCK] No real history store connected -- this is simulated data."],
-        }
-
-    return [trigger_immediate_alert, query_rag_history]
+    return [trigger_immediate_alert, _build_query_rag_history_tool()]
 
 
 def _build_system_prompt(state: AgentState) -> str:
@@ -162,7 +229,19 @@ def _build_system_prompt(state: AgentState) -> str:
         "need immediate human/Amazon Polly voice intervention.\n"
         "- query_rag_history: use when this specific user's own historical incident "
         "pattern would materially change the urgency assessment and isn't already "
-        "covered by the passive RAG context above.\n\n"
+        "covered by the passive RAG context above. It returns ONLY this user_id's own "
+        "past incidents (strictly filtered, never another user's) -- an empty result "
+        "means this user genuinely has no prior incidents on record, not that the "
+        "lookup failed.\n\n"
+        "User identity note: User ID is the sender's permanent Telegram account "
+        "identifier (tied to their phone number), so you never need to justify how "
+        "you know two messages are from the same person -- that identity is already "
+        "established. This does NOT license inventing specifics, though: only state "
+        "a fact about 'this user's history' if it is literally present in "
+        "query_rag_history's returned result for THIS call. Do not generalize, "
+        "infer, or restate a pattern (e.g. 'recurring dark thoughts', 'repeated "
+        "message deletion') that the tool result doesn't actually contain -- an "
+        "output-screening check will reject any such unsupported claim.\n\n"
         "If no tool is needed, respond directly -- your final answer will be parsed "
         "into a structured assessment."
     )
@@ -239,6 +318,7 @@ def make_decision_agent_node(llm: ChatGoogleGenerativeAI, tools: list):
             "final_urgency_assessment": decision.final_urgency_assessment,
             "recommended_action": decision.recommended_action,
             "summary_for_human_reviewer": decision.summary_for_human_reviewer,
+            "confidence_score": decision.confidence_score,
         }
 
     return decision_agent_node
@@ -261,16 +341,27 @@ HALLUCINATION_SYSTEM_PROMPT = """את/ה בודק/ת בקרת-איכות על ת
 טריאז' מצוקה (SafeSignal). קיבלת כמה קטעי טקסט: "הודעת המשתמש המקורית" (raw input), \
 "הסיווג האוטומטי" (distress classification) שנקבע לה קודם בפייפליין, ה"הקשר" (context) \
 שאותר ממאגר הידע (RAG), "כלים שהופעלו בפועל" (tools actually executed) - רשימת שמות \
-הכלים שהסוכן קרא להם בפועל במהלך הריצה, ו"פלט הסוכן" (agent output) - הערכת המצב הסופית \
-שהסוכן ניסח.
+הכלים שהסוכן קרא להם בפועל במהלך הריצה, "תוצאות בפועל של הכלים שהופעלו" - התוכן שהכלים \
+האלה החזירו בפועל (למשל מה ש-query_rag_history שלף), ו"פלט הסוכן" (agent output) - הערכת \
+המצב הסופית שהסוכן ניסח.
 
 תפקידך: לבדוק אם פלט הסוכן כולל טענות עובדתיות שאינן נתמכות ע"י אף אחד מהמקורות שסופקו \
-(הודעת המשתמש המקורית, הסיווג האוטומטי, הקשר ה-RAG, או רשימת הכלים שהופעלו בפועל) - כלומר \
-פרטים, המלצות פעולה קונקרטיות או קביעות עובדתיות שהסוכן "המציא" ואינן מבוססות על אף אחד \
-מהם. ציטוט או תיאור של הודעת המשתמש המקורית, הפניה לסיווג האוטומטי שכבר נקבע, או טענה \
-שפעולה/התראה מסוימת בוצעה/נשלחה - כאשר שם הכלי המתאים (למשל trigger_immediate_alert) \
-מופיע ברשימת "כלים שהופעלו בפועל" - אינם הזיה, גם אם אינם מופיעים במאגר ה-RAG. טענה על \
-פעולה שבוצעה כש*אין* כלי תואם ברשימה כן נחשבת הזיה.
+(הודעת המשתמש המקורית, הסיווג האוטומטי, הקשר ה-RAG, רשימת הכלים שהופעלו בפועל, או תוצאות \
+הכלים בפועל) - כלומר פרטים, המלצות פעולה קונקרטיות או קביעות עובדתיות שהסוכן "המציא" ואינן \
+מבוססות על אף אחד מהם. ציטוט או תיאור של הודעת המשתמש המקורית, הפניה לסיווג האוטומטי שכבר \
+נקבע, טענה שפעולה/התראה מסוימת בוצעה/נשלחה - כאשר שם הכלי המתאים (למשל \
+trigger_immediate_alert) מופיע ברשימת "כלים שהופעלו בפועל" - וכן כל פרט שמופיע בפועל \
+בתוך "תוצאות בפועל של הכלים שהופעלו" (למשל תוצאה שהוחזרה מ-query_rag_history) - אינם הזיה, \
+גם אם אינם חוזרים על עצמם במאגר ה-RAG. טענה על פעולה שבוצעה כש*אין* כלי תואם ברשימה, או \
+טענה על פרט מ"היסטוריית המשתמש" שאינו מופיע בפועל בתוצאות הכלים שהופעלו (ולא רק נטען שהוא \
+שם) - כן נחשבת הזיה.
+
+זהות המשתמש (User ID) מבוססת על מזהה חשבון הטלגרם הקבוע של השולח (הצמוד למספר הטלפון שלו), \
+ולכן אין צורך שהסוכן "יוכיח" בכל פעם איך הוא יודע שמדובר באותו משתמש - זה נתון לגיטימי \
+מראש ואינו הזיה כשלעצמו. אבל זה *לא* פוטר מבדיקת התוכן: אם הסוכן טוען טענה ספציפית על \
+"ההיסטוריה של המשתמש" (למשל סוג אירוע, ביטוי או דפוס חוזר מסוים), הטענה חייבת להופיע בפועל \
+בתוך "תוצאות בפועל של הכלים שהופעלו" - זהות המשתמש לבדה אינה מספיקה כבסיס לפרט עובדתי שלא \
+הוחזר בפועל מאף מקור.
 
 אל תסמן כהזיה: ניסוח מחדש סביר, מסקנות לוגיות ישירות מההקשר, או שימוש בשיקול דעת מקצועי \
 כללי (כמו "מומלץ ליצור קשר עם קו סיוע") שאינו סותר את ההקשר.
@@ -338,6 +429,7 @@ def _run_hallucination_check(
     raw_input: str = "",
     distress_classification: str = "",
     tools_triggered: list[str] | None = None,
+    tool_results: str = "",
     incident_id: str = "",
 ) -> dict:
     """
@@ -355,9 +447,18 @@ def _run_hallucination_check(
     alert has been sent" whenever the matching tool (e.g.
     trigger_immediate_alert) really had been called -- the checker had no
     way to know that, since tool-execution results aren't part of the RAG/
-    classification/raw-input sources it otherwise compares against. Fails
-    *safe* on any error: treats the check as a hallucination so the graph
-    retries/escalates instead of silently skipping the check.
+    classification/raw-input sources it otherwise compares against.
+
+    tool_results (added 2026-07-28) carries the actual returned content of
+    those tool calls (e.g. query_rag_history's JSON payload), pulled from the
+    ToolMessage entries already sitting in state.messages -- previously only
+    the tool *names* were passed here, so any specific fact the agent quoted
+    from query_rag_history's real output (as opposed to the passive RAG
+    context) had no way to be verified and was always flagged as fabricated,
+    even when it was a faithful quote of what the tool actually returned.
+
+    Fails *safe* on any error: treats the check as a hallucination so the
+    graph retries/escalates instead of silently skipping the check.
     """
     if not agent_output or not agent_output.strip():
         return {"hallucination_detected": False, "reason": "empty_output_nothing_to_check"}
@@ -369,6 +470,8 @@ def _run_hallucination_check(
             f"הסיווג האוטומטי שנקבע לפנייה:\n{distress_classification or '(לא זמין)'}\n\n"
             f"הקשר (RAG context) שאותר עבור הפנייה:\n{rag_context or '(אין הקשר זמין)'}\n\n"
             f"כלים שהופעלו בפועל:\n{tools_triggered or '(לא הופעל אף כלי)'}\n\n"
+            f"תוצאות בפועל של הכלים שהופעלו (למשל מה שהוחזר מ-query_rag_history):\n"
+            f"{tool_results or '(אין תוצאות כלים זמינות)'}\n\n"
             f"פלט הסוכן לבדיקה:\n{agent_output}"
         )
         response = client.messages.create(
@@ -395,6 +498,20 @@ def _run_hallucination_check(
     except Exception as e:
         print(f"[Hallucination Check Error] {e}")
         return {"hallucination_detected": True, "reason": f"hallucination_check_failed: {e}"}
+
+
+def _format_tool_results(messages: list) -> str:
+    """
+    Pulls the actual returned content of every ToolMessage sitting in
+    state.messages (written there by the prebuilt ToolNode after a real tool
+    call, e.g. query_rag_history's JSON payload) and renders it as text for
+    the hallucination checker. Without this, the checker only ever saw the
+    tool *name* that ran, never what it actually returned -- so it had no
+    way to confirm a specific claim the agent made really came from that
+    call, and flagged it as fabricated by default.
+    """
+    results = [f"[{m.name}] {m.content}" for m in messages if isinstance(m, ToolMessage)]
+    return "\n".join(results)
 
 
 def output_screening_node(state: AgentState) -> dict:
@@ -425,6 +542,7 @@ def output_screening_node(state: AgentState) -> dict:
             state.raw_input,
             state.distress_classification,
             state.tools_triggered,
+            tool_results=_format_tool_results(state.messages),
             incident_id=state.incident_id,
         )
 

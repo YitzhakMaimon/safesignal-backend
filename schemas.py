@@ -39,6 +39,10 @@ class AgentState(BaseModel):
     final_urgency_assessment: str = ""
     recommended_action: str = ""
     summary_for_human_reviewer: str = ""
+    # Model's own confidence in final_urgency_assessment, 0.0-1.0. None until
+    # decision_agent_node's structured-output pass runs (e.g. still mid tool-call
+    # loop) -- the Alert History table renders that as a blank cell, not "0%".
+    confidence_score: float | None = None
 
     # Populated by output_screening_node: Bedrock Guardrails + Claude Haiku
     # hallucination check on the Decision Agent's own generated text, run
@@ -72,15 +76,6 @@ class IncidentStatusUpdate(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
-class IngestionSettingsUpdate(BaseModel):
-    """Validates the PUT /api/v1/settings/scan request body sent by the
-    dashboard's Operational Metrics settings panel."""
-
-    message_limit: int = Field(alias="messageLimit", ge=1, le=50)
-    interval_minutes: int = Field(alias="intervalMinutes", ge=1, le=1440)
-
-    model_config = ConfigDict(populate_by_name=True)
-
 
 class DecisionOutput(BaseModel):
     """Structured output schema forced on the LLM via `.with_structured_output()`."""
@@ -104,4 +99,12 @@ class DecisionOutput(BaseModel):
     recommended_action: str = Field(description="Short description of the next routing step.")
     summary_for_human_reviewer: str = Field(
         description="Factual summary of the incident for the manual control dashboard."
+    )
+    confidence_score: float = Field(
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Your confidence in final_urgency_assessment, from 0.0 (a guess) to "
+            "1.0 (certain), based on how clearly the raw input and context support it."
+        ),
     )

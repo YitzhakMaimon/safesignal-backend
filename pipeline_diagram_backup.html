@@ -1,0 +1,668 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SafeSignal — System Pipeline</title>
+<style>
+  :root{
+    --bg:#060907;
+    --bg-elev:#0d1512;
+    --bg-elev-2:#101a16;
+    --line:rgba(57,255,140,.16);
+    --line-soft:rgba(57,255,140,.08);
+    --accent:#39ff8c;
+    --accent-soft:#1fae63;
+    --accent-dim:#0f5c37;
+    --text-primary:#eafff2;
+    --text-secondary:#8fb3a1;
+    --text-faint:#4d6b5c;
+    --alert:#ffb347;
+    --font-display:"Segoe UI Semibold","Segoe UI",Arial,sans-serif;
+    --font-body:"Segoe UI","Rubik",Arial,sans-serif;
+    --font-mono:"Cascadia Code","Consolas","SF Mono",ui-monospace,monospace;
+    color-scheme: dark;
+  }
+
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;background:var(--bg);}
+  body{
+    font-family:var(--font-body);
+    color:var(--text-primary);
+    overflow-x:hidden;
+    -webkit-font-smoothing:antialiased;
+  }
+
+  #rain{
+    position:fixed;
+    inset:0;
+    width:100%;
+    height:100%;
+    z-index:0;
+    opacity:.45;
+    pointer-events:none;
+  }
+
+  .page{
+    position:relative;
+    z-index:1;
+    max-width:1080px;
+    margin:0 auto;
+    padding:0 24px 120px;
+  }
+
+  /* ---------- HERO ---------- */
+  .hero{
+    padding:96px 0 88px;
+    text-align:center;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    gap:22px;
+  }
+
+  .status-pill{
+    display:inline-flex;
+    align-items:center;
+    gap:9px;
+    font-family:var(--font-mono);
+    font-size:12.5px;
+    letter-spacing:.06em;
+    color:var(--accent);
+    border:1px solid var(--accent-dim);
+    background:linear-gradient(180deg, rgba(57,255,140,.09), rgba(57,255,140,.02));
+    padding:7px 16px;
+    border-radius:999px;
+    direction:ltr;
+  }
+  .status-pill .dot{
+    width:7px;height:7px;border-radius:50%;
+    background:var(--accent);
+    box-shadow:0 0 8px 2px var(--accent);
+    animation:blink 1.8s ease-in-out infinite;
+  }
+  @keyframes blink{
+    0%,100%{opacity:1;}
+    50%{opacity:.25;}
+  }
+
+  .wordmark{
+    font-family:var(--font-display);
+    font-weight:700;
+    font-size:clamp(42px,8vw,84px);
+    letter-spacing:.01em;
+    margin:0;
+    direction:ltr;
+    line-height:1;
+    text-wrap:balance;
+    color:var(--text-primary);
+    text-shadow:0 0 40px rgba(57,255,140,.25);
+  }
+  .wordmark span{
+    color:var(--accent);
+    text-shadow:0 0 24px var(--accent), 0 0 60px rgba(57,255,140,.5);
+  }
+
+  .tagline{
+    max-width:56ch;
+    margin:0;
+    font-size:17px;
+    line-height:1.75;
+    color:var(--text-secondary);
+  }
+  .tagline b{
+    color:var(--text-primary);
+    font-weight:600;
+  }
+
+  .hero-meta{
+    margin-top:14px;
+    display:flex;
+    gap:28px;
+    flex-wrap:wrap;
+    justify-content:center;
+    font-family:var(--font-mono);
+    font-size:11.5px;
+    letter-spacing:.05em;
+    color:var(--text-faint);
+    direction:ltr;
+  }
+  .hero-meta strong{ color:var(--accent-soft); }
+
+  /* ---------- PIPELINE ---------- */
+  .pipeline{
+    position:relative;
+    padding-top:24px;
+  }
+
+  .spine{
+    position:absolute;
+    top:0;
+    bottom:0;
+    left:50%;
+    width:2px;
+    transform:translateX(-1px);
+    background:repeating-linear-gradient(
+      to bottom,
+      var(--accent) 0 10px,
+      transparent 10px 26px
+    );
+    background-size:2px 320px;
+    animation:flow 5.5s linear infinite;
+    filter:drop-shadow(0 0 6px var(--accent));
+    opacity:.85;
+  }
+
+  @keyframes flow{
+    to{ background-position-y: 320px; }
+  }
+
+  .nodes{
+    list-style:none;
+    margin:0;
+    padding:0;
+    display:flex;
+    flex-direction:column;
+    gap:64px;
+  }
+
+  .node{
+    position:relative;
+    width:calc(50% - 46px);
+    opacity:0;
+    transform:translateY(28px);
+    transition:opacity .7s ease, transform .7s ease;
+  }
+  .node.in-view{ opacity:1; transform:translateY(0); }
+
+  .node.side-r{ margin-inline-start:auto; }
+  .node.side-l{ margin-inline-end:auto; }
+
+  .node-index{
+    position:absolute;
+    top:14px;
+    width:34px;
+    height:34px;
+    border-radius:50%;
+    background:var(--bg);
+    border:1.5px solid var(--accent-dim);
+    color:var(--text-faint);
+    font-family:var(--font-mono);
+    font-size:12px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    direction:ltr;
+    transition:border-color .5s ease, color .5s ease, box-shadow .5s ease;
+    z-index:2;
+  }
+  .node.in-view .node-index{
+    border-color:var(--accent);
+    color:var(--accent);
+    box-shadow:0 0 14px rgba(57,255,140,.55);
+  }
+
+  .node.side-r .node-index{ left:-63px; }
+  .node.side-l .node-index{ right:-63px; }
+
+  .node-connector{
+    position:absolute;
+    top:31px;
+    width:29px;
+    height:2px;
+    background:var(--accent-dim);
+    transition:background .5s ease, box-shadow .5s ease;
+  }
+  .node.in-view .node-connector{
+    background:var(--accent);
+    box-shadow:0 0 10px var(--accent);
+  }
+  .node.side-r .node-connector{ left:-29px; }
+  .node.side-l .node-connector{ right:-29px; }
+
+  .card{
+    background:linear-gradient(160deg, var(--bg-elev-2), var(--bg-elev));
+    border:1px solid var(--line);
+    border-radius:14px;
+    padding:22px 24px 24px;
+    transition:border-color .5s ease, box-shadow .5s ease, transform .35s ease;
+  }
+  .node.in-view .card{
+    border-color:rgba(57,255,140,.4);
+    box-shadow:0 0 0 1px rgba(57,255,140,.05), 0 18px 40px -18px rgba(57,255,140,.35);
+  }
+  .card:hover{ transform:translateY(-3px); }
+
+  .node.final .card{
+    border-color:rgba(255,179,71,.45);
+  }
+  .node.final.in-view .card{
+    box-shadow:0 0 0 1px rgba(255,179,71,.08), 0 18px 44px -16px rgba(255,179,71,.4);
+  }
+  .node.final .node-index{ border-color:var(--alert); color:var(--alert); }
+  .node.final .node-connector{ background:var(--alert); box-shadow:0 0 10px var(--alert); }
+
+  .card-top{
+    display:flex;
+    align-items:center;
+    gap:12px;
+    margin-bottom:12px;
+  }
+
+  .icon-wrap{
+    width:38px;
+    height:38px;
+    flex:none;
+    border-radius:10px;
+    background:rgba(57,255,140,.07);
+    border:1px solid var(--line);
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    color:var(--accent-soft);
+    transition:color .5s ease, background .5s ease;
+  }
+  .node.in-view .icon-wrap{ color:var(--accent); background:rgba(57,255,140,.12); }
+  .node.final .icon-wrap{ color:var(--alert); background:rgba(255,179,71,.1); }
+  .icon-wrap svg{ width:20px; height:20px; }
+
+  .step-tag{
+    font-family:var(--font-mono);
+    font-size:11px;
+    letter-spacing:.08em;
+    color:var(--text-faint);
+    direction:ltr;
+  }
+
+  .card h2{
+    margin:0 0 8px;
+    font-family:var(--font-display);
+    font-size:19px;
+    font-weight:700;
+    color:var(--text-primary);
+    text-wrap:balance;
+  }
+
+  .card p{
+    margin:0 0 14px;
+    font-size:14.5px;
+    line-height:1.75;
+    color:var(--text-secondary);
+    max-width:46ch;
+  }
+
+  .chips{
+    display:flex;
+    flex-wrap:wrap;
+    gap:8px;
+  }
+  .chip{
+    font-family:var(--font-mono);
+    font-size:11px;
+    letter-spacing:.03em;
+    color:var(--accent-soft);
+    border:1px solid var(--accent-dim);
+    background:rgba(57,255,140,.05);
+    padding:4px 10px;
+    border-radius:999px;
+    direction:ltr;
+  }
+  .node.final .chip{ color:var(--alert); border-color:rgba(255,179,71,.5); background:rgba(255,179,71,.07); }
+
+  /* ---------- FOOTER ---------- */
+  .site-footer{
+    margin-top:110px;
+    padding-top:36px;
+    border-top:1px solid var(--line);
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    gap:10px;
+    text-align:center;
+  }
+  .site-footer .fw{
+    font-family:var(--font-mono);
+    font-size:12px;
+    letter-spacing:.1em;
+    color:var(--text-faint);
+    direction:ltr;
+  }
+  .site-footer .fw span{ color:var(--accent-soft); }
+  .site-footer p{
+    margin:0;
+    font-size:13.5px;
+    color:var(--text-faint);
+    max-width:50ch;
+  }
+
+  /* ---------- RESPONSIVE ---------- */
+  @media (max-width:760px){
+    .spine{ left:17px; right:auto; transform:none; }
+    .node{ width:100%; margin-inline:0 !important; padding-left:52px; padding-right:0; }
+    .node .node-index{ right:auto !important; left:-1px !important; top:14px; }
+    .node .node-connector{ right:auto !important; left:26px !important; width:22px; }
+    .hero{ padding:64px 0 56px; }
+    .hero-meta{ gap:16px; }
+  }
+
+  @media (prefers-reduced-motion: reduce){
+    .spine{ animation:none; }
+    .status-pill .dot{ animation:none; }
+    .node{ transition:none; opacity:1; transform:none; }
+    .card:hover{ transform:none; }
+  }
+</style>
+</head>
+<body>
+
+<canvas id="rain" aria-hidden="true"></canvas>
+
+<div class="page">
+
+  <header class="hero">
+    <span class="status-pill"><span class="dot"></span>LIVE MONITORING</span>
+    <h1 class="wordmark">SAFE<span>//</span>SIGNAL</h1>
+    <p class="tagline">
+      <b>SafeSignal</b> listens to social media in real time, detecting signs of distress and risk
+      within an ocean of content, and routes them through a chain of analysis, context retrieval,
+      and decision-making — until a trustworthy alert arrives in time.
+    </p>
+    <div class="hero-meta">
+      <span><strong>10</strong> STAGES</span>
+      <span><strong>3</strong> INGEST SOURCES</span>
+      <span><strong>2×</strong> GUARDRAILS</span>
+      <span><strong>REAL-TIME</strong> OUTPUT</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="pipeline" aria-label="Flow diagram of the SafeSignal system">
+      <div class="spine" aria-hidden="true"></div>
+
+      <ol class="nodes">
+
+        <li class="node side-l" data-i="0">
+          <span class="node-index">00</span>
+          <span class="node-connector"></span>
+          <div class="card">
+            <div class="card-top">
+              <span class="icon-wrap">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 3v4"/><path d="M8 7a5 5 0 0 1 8 0"/><path d="M5 7a9 9 0 0 1 14 0"/>
+                  <circle cx="12" cy="17" r="3"/>
+                </svg>
+              </span>
+              <span class="step-tag">STEP 00 · INGEST</span>
+            </div>
+            <h2>Signal Ingestion</h2>
+            <p>The system monitors Telegram, Reddit, and Twitter/X channels in real time, capturing every suspicious message the moment it's posted — before it's lost in the stream.</p>
+            <div class="chips"><span class="chip">Telegram</span><span class="chip">Reddit</span><span class="chip">Twitter / X</span></div>
+          </div>
+        </li>
+
+        <li class="node side-r" data-i="1">
+          <span class="node-index">01</span>
+          <span class="node-connector"></span>
+          <div class="card">
+            <div class="card-top">
+              <span class="icon-wrap">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <ellipse cx="12" cy="5.5" rx="7.5" ry="2.8"/>
+                  <path d="M4.5 5.5V17c0 1.5 3.3 2.8 7.5 2.8s7.5-1.3 7.5-2.8V5.5"/>
+                  <path d="M4.5 11.3c0 1.5 3.3 2.8 7.5 2.8s7.5-1.3 7.5-2.8"/>
+                </svg>
+              </span>
+              <span class="step-tag">STEP 01 · STORE</span>
+            </div>
+            <h2>Raw Archival in S3</h2>
+            <p>Every captured message is stored exactly as received, unprocessed, in a dedicated bucket — a source copy for auditing, recovery, and future model training.</p>
+            <div class="chips"><span class="chip">Amazon S3</span></div>
+          </div>
+        </li>
+
+        <li class="node side-l" data-i="2">
+          <span class="node-index">02</span>
+          <span class="node-connector"></span>
+          <div class="card">
+            <div class="card-top">
+              <span class="icon-wrap">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M8 10a4 4 0 1 1 4 4"/><path d="M12 14v3"/>
+                  <path d="M9 4.5c1-1 2-1.5 3-1.5s2 .5 3 1.5"/>
+                  <circle cx="12" cy="9.5" r="6.5"/>
+                  <path d="M6.5 20.5h11l-1.2-3.2h-8.6z"/>
+                </svg>
+              </span>
+              <span class="step-tag">STEP 02 · NLP</span>
+            </div>
+            <h2>Language Understanding</h2>
+            <p>HeBERT reads Hebrew in all its nuance — slang, spelling errors, and cultural context — while Comprehend, in parallel, detects entities, sentiment, and personal information, with support for 12 languages.</p>
+            <div class="chips"><span class="chip">HeBERT</span><span class="chip">AWS Comprehend</span><span class="chip">12 Languages</span></div>
+          </div>
+        </li>
+
+        <li class="node side-r" data-i="3">
+          <span class="node-index">03</span>
+          <span class="node-connector"></span>
+          <div class="card">
+            <div class="card-top">
+              <span class="icon-wrap">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M8 9.5V5.8C8 4 9.2 3 10.6 3c1 0 1.7.6 2 1.4"/>
+                  <path d="M15 9.5V5.5c0-1.2.8-2 1.9-2 1.2 0 1.9.9 1.9 2.2v3.8"/>
+                  <path d="M6.5 11c0-1 .7-1.8 1.7-1.8h7.6c1 0 1.7.8 1.7 1.8v5.3c0 3-2.4 5.2-5.5 5.2s-5.5-2.2-5.5-5.2z"/>
+                  <path d="M9.5 15h5"/>
+                </svg>
+              </span>
+              <span class="step-tag">STEP 03 · INFERENCE</span>
+            </div>
+            <h2>Local Inference Engine — Ollama</h2>
+            <p>A local language model named Ollama runs inside the infrastructure itself, keeping personal details and identifiers private.</p>
+            <div class="chips"><span class="chip">Ollama · Local Model</span></div>
+          </div>
+        </li>
+
+        <li class="node side-l" data-i="4">
+          <span class="node-index">04</span>
+          <span class="node-connector"></span>
+          <div class="card">
+            <div class="card-top">
+              <span class="icon-wrap">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6z"/>
+                  <path d="M9.5 12l1.8 1.8 3.2-3.6"/>
+                </svg>
+              </span>
+              <span class="step-tag">STEP 04 · CLASSIFY</span>
+            </div>
+            <h2>Distress Classification (Bedrock)</h2>
+            <p>Incoming content is classified, then passed down the chain to the decision-agent node.</p>
+            <div class="chips"><span class="chip">Bedrock</span></div>
+          </div>
+        </li>
+
+        <li class="node side-r" data-i="5">
+          <span class="node-index">05</span>
+          <span class="node-connector"></span>
+          <div class="card">
+            <div class="card-top">
+              <span class="icon-wrap">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="5" y="3.5" width="10" height="15" rx="1.3"/>
+                  <path d="M7.5 7.5h5M7.5 10.5h5M7.5 13.5h3"/>
+                  <circle cx="16.5" cy="16.5" r="3"/>
+                  <path d="M18.8 18.8L21 21"/>
+                </svg>
+              </span>
+              <span class="step-tag">STEP 05 · RETRIEVE</span>
+            </div>
+            <h2>Context Retrieval (RAG)</h2>
+            <p>Before a decision is made, the system retrieves relevant documents, protocols, and precedents from a dedicated knowledge base — grounding the decision in facts rather than the model's guess alone.</p>
+            <div class="chips"><span class="chip">Vector Store</span><span class="chip">RAG</span></div>
+          </div>
+        </li>
+
+        <li class="node side-l" data-i="6">
+          <span class="node-index">06</span>
+          <span class="node-connector"></span>
+          <div class="card">
+            <div class="card-top">
+              <span class="icon-wrap">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="6" cy="6" r="2.3"/><circle cx="18" cy="6" r="2.3"/>
+                  <circle cx="12" cy="18" r="2.3"/>
+                  <path d="M7.8 7.6L10.5 16"/><path d="M16.2 7.6L13.5 16"/><path d="M8.3 6h7.4"/>
+                </svg>
+              </span>
+              <span class="step-tag">STEP 06 · DECIDE</span>
+            </div>
+            <h2>Decision Agent</h2>
+            <p>A LangGraph-based agent graph combines every insight gathered so far, weighs the severity of the evidence, and decides: dismiss, monitor, or alert.</p>
+            <div class="chips"><span class="chip">LangGraph</span></div>
+          </div>
+        </li>
+
+        <li class="node side-r" data-i="7">
+          <span class="node-index">07</span>
+          <span class="node-connector"></span>
+          <div class="card">
+            <div class="card-top">
+              <span class="icon-wrap">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6z"/>
+                  <rect x="9.5" y="10.5" width="5" height="4" rx=".8"/>
+                  <path d="M10.3 10.5V9a1.7 1.7 0 0 1 3.4 0v1.5"/>
+                </svg>
+              </span>
+              <span class="step-tag">STEP 07 · SCREEN</span>
+            </div>
+            <h2>Final Output Screening</h2>
+            <p>Before the alert goes out, a Guardrails layer filters unnecessary identifying information — but deliberately preserves contact details for crisis and emergency hotlines.</p>
+            <div class="chips"><span class="chip">Bedrock Guardrails</span></div>
+          </div>
+        </li>
+
+        <li class="node side-l" data-i="8">
+          <span class="node-index">08</span>
+          <span class="node-connector"></span>
+          <div class="card">
+            <div class="card-top">
+              <span class="icon-wrap">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M4 19a8 8 0 0 1 16 0"/>
+                  <path d="M12 19l4.2-6.2"/>
+                  <circle cx="12" cy="19" r="1.1" fill="currentColor" stroke="none"/>
+                </svg>
+              </span>
+              <span class="step-tag">STEP 08 · EVALUATE</span>
+            </div>
+            <h2>Reliability Evaluation (RAGAS)</h2>
+            <p>Before an alert is considered trustworthy, RAGAS checks how faithful the decision is to the retrieved sources, and how relevant it is to the original event.</p>
+            <div class="chips"><span class="chip">RAGAS</span></div>
+          </div>
+        </li>
+
+        <li class="node side-r final" data-i="9">
+          <span class="node-index">09</span>
+          <span class="node-connector"></span>
+          <div class="card">
+            <div class="card-top">
+              <span class="icon-wrap">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="3.5" y="4.5" width="17" height="12" rx="1.4"/>
+                  <path d="M8.5 20.5h7M12 16.5v4"/>
+                  <path d="M6.5 12.5l2.6-3.4 2.2 2.4 3-4 2.7 3.3"/>
+                </svg>
+              </span>
+              <span class="step-tag">STEP 09 · OUTPUT</span>
+            </div>
+            <h2>Real-Time Alert</h2>
+            <p>The final finding — with a risk level, explanation, and sources — reaches the SafeSignal dashboard and everyone who needs to act, in real time.</p>
+            <div class="chips"><span class="chip">SafeSignal Dashboard</span></div>
+          </div>
+        </li>
+
+      </ol>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <span class="fw">SAFE<span>//</span>SIGNAL</span>
+    <p>From social media to human response — one pipeline, in real time.</p>
+  </footer>
+
+</div>
+
+<script>
+(function(){
+  document.documentElement.setAttribute('dir','ltr');
+  document.documentElement.setAttribute('lang','en');
+
+  var reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  var nodes = document.querySelectorAll('.node');
+  if('IntersectionObserver' in window && !reduce){
+    var io = new IntersectionObserver(function(entries){
+      entries.forEach(function(e){
+        if(e.isIntersecting){ e.target.classList.add('in-view'); io.unobserve(e.target); }
+      });
+    }, { threshold: 0.22 });
+    nodes.forEach(function(n){ io.observe(n); });
+  } else {
+    nodes.forEach(function(n){ n.classList.add('in-view'); });
+  }
+
+  var canvas = document.getElementById('rain');
+  var ctx = canvas.getContext('2d');
+  var w, h, cols, drops, offsets;
+  var word = 'SAFESIGNAL  ';
+
+  function size(){
+    w = canvas.width = window.innerWidth;
+    h = canvas.height = window.innerHeight;
+    cols = Math.floor(w / 30);
+    drops = new Array(cols).fill(0).map(function(){ return Math.random() * -50; });
+    offsets = new Array(cols).fill(0).map(function(){ return Math.floor(Math.random()*word.length); });
+  }
+  size();
+  window.addEventListener('resize', size);
+
+  function drawStatic(){
+    ctx.fillStyle = '#060907';
+    ctx.fillRect(0,0,w,h);
+    ctx.font = 'bold 16px monospace';
+    ctx.fillStyle = 'rgba(57,255,140,0.05)';
+    for(var i=0;i<cols;i++){
+      var y = (i * 97) % h;
+      ctx.fillText(word[(i + offsets[i]) % word.length], i*30, y);
+    }
+  }
+
+  if(reduce){
+    drawStatic();
+    return;
+  }
+
+  function frame(){
+    ctx.fillStyle = 'rgba(6,9,7,0.06)';
+    ctx.fillRect(0,0,w,h);
+    ctx.font = 'bold 16px monospace';
+    for(var i=0;i<cols;i++){
+      var idx = Math.floor(drops[i] + offsets[i]) % word.length;
+      if(idx < 0){ idx += word.length; }
+      var ch = word[idx];
+      var y = drops[i]*20;
+      var alpha = Math.random()*0.25 + 0.06;
+      ctx.fillStyle = 'rgba(57,255,140,'+alpha+')';
+      ctx.fillText(ch, i*30, y);
+      if(y > h && Math.random() > 0.975){ drops[i] = 0; }
+      drops[i] += 0.45;
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+
+</body>
+</html>
