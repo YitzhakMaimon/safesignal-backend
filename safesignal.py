@@ -402,6 +402,7 @@ async def rag_context(req: Request):
         # ולא merged() גנרי, בדיוק המקרה שההערה למעלה מזהירה מפניו.
         "incident_id": body.get("incident_id", ""),
         "user_id": body.get("user_id", "anonymous"),
+        "platform": body.get("platform", "telegram"),
         # שדות בבעלות Bedrock (distress_classification.py) - מועברים הלאה במפורש.
         "class": body.get("class", PLACEHOLDER_FIELDS["class"]),
         "risk_level": body.get("risk_level", PLACEHOLDER_FIELDS["risk_level"]),

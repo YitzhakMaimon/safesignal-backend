@@ -121,6 +121,7 @@ def serialize_history_row(incident: Incident, log_id: int) -> dict:
         "logId": log_id,
         "timestamp": format_history_timestamp(incident.created_at),
         "userOrIp": incident.user_id,
+        "platform": incident.platform,
         "category": category_code_for(incident.distress_classification),
         "detectedText": incident.raw_text,
         "resolution": incident.status,

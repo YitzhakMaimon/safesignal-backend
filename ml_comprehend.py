@@ -1,4 +1,5 @@
 import os
+import re
 import boto3
 import torch
 from anthropic import AnthropicBedrock
@@ -98,6 +99,7 @@ class DistressScreeningPipeline:
             "הלילה האחרון שלי", "הפעם האחרונה שלי", "היום האחרון שלי",
             "קופץ מהגג", "קופץ מהחלון", "קופץ מהקומה", "קופץ מהבניין",
             "אני קופץ", "לקפוץ מלמעלה", "לקפוץ מהגג", "לקפוץ מהחלון",
+            "הצילו",
         ]
 
         # אותה רשת ביטחון עבור אנגלית - נחוצה כי Comprehend מבוסס סנטימנט מילולי-שטחי
@@ -241,6 +243,16 @@ class DistressScreeningPipeline:
             "translated_text": translated,
         }
 
+    @staticmethod
+    def _normalize_repeated_chars(text: str, max_repeat: int = 2) -> str:
+        """
+        מכווץ רצפים של אותו תו (3+ ברצף) ל-max_repeat מופעים -- לא מסנן/דוחה כלום,
+        רק "מיישר" הארכה טקסטואלית (למשל "הצילווווו") כך שהתאמת trigger_phrases
+        וניקוד HeBERT/Comprehend יזהו את המילה האמיתית מתחתיה, גם כשההארכה נופלת
+        באמצע המילה ("הציייילו") ולא רק בסופה.
+        """
+        return re.sub(r'([^\s])\1{2,}', r'\1' * max_repeat, text)
+
     def analyze_post(self, text: str, incident_id: str = "") -> dict:
         """
         מריץ את תהליך הסינון על הטקסט ומחליט האם להעבירו להמשך הצינור (True/False).
@@ -250,16 +262,21 @@ class DistressScreeningPipeline:
         if not text or not text.strip():
             return {"passed_screening": False, "reason": "Empty input"}
 
-        language = self.detect_language(text)
+        # normalized_text מוזן לכל בדיקות הזיהוי (שפה/ניקוד/trigger); text המקורי
+        # נשמר כפי שהוא ב-raw_metrics/return כדי שהלוג/הדשבורד יציגו את מה
+        # שהמשתמש בפועל כתב.
+        normalized_text = self._normalize_repeated_chars(text)
+
+        language = self.detect_language(normalized_text)
 
         if language == 'he':
-            distress_probability, num_chunks = self._score_hebrew_distress(text, incident_id=incident_id)
+            distress_probability, num_chunks = self._score_hebrew_distress(normalized_text, incident_id=incident_id)
             label = 'NEGATIVE' if distress_probability >= 0.5 else 'NEUTRAL'
             score = max(distress_probability, 1 - distress_probability)
             source = "HeBERT" if num_chunks == 1 else f"HeBERT({num_chunks} chunks)"
         elif language in COMPREHEND_SENTIMENT_LANGUAGES:
             try:
-                res = self.comprehend.detect_sentiment(Text=text, LanguageCode=language)
+                res = self.comprehend.detect_sentiment(Text=normalized_text, LanguageCode=language)
                 label = res['Sentiment']  # POSITIVE, NEGATIVE, NEUTRAL, MIXED
                 score = res['SentimentScore'].get(label.capitalize(), 0.0)
                 distress_probability = res['SentimentScore'].get('Negative', 0.0)
@@ -283,7 +300,7 @@ class DistressScreeningPipeline:
             }
 
         # בדיקת רמזים שקטים (Trigger Words) - הרשימה כרגע בעברית בלבד
-        found_triggers = [phrase for phrase in self.trigger_phrases if phrase in text]
+        found_triggers = [phrase for phrase in self.trigger_phrases if phrase in normalized_text]
         has_trigger = len(found_triggers) > 0
 
         # מנוע החלטה - סף על הסתברות רציפה, לא רק על החלטת argmax בינארית.
@@ -304,7 +321,9 @@ class DistressScreeningPipeline:
         # סופית שהפוסט תקין (recall-first, ראו הערה למעלה).
         cross_check = None
         if not passed_screening and language in ('he', 'en'):
-            cross_check = self._cross_check_via_translation(text, source_language=language, incident_id=incident_id)
+            cross_check = self._cross_check_via_translation(
+                normalized_text, source_language=language, incident_id=incident_id
+            )
             if cross_check and cross_check["distress_probability"] >= DISTRESS_THRESHOLD:
                 passed_screening = True
                 reason = (

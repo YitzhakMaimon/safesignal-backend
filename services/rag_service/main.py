@@ -71,6 +71,7 @@ async def rag_context(req: dict):
         "text_content": text,
         "incident_id": req.get("incident_id", ""),
         "user_id": req.get("user_id", "anonymous"),
+        "platform": req.get("platform", "telegram"),
         "class": req.get("class", DEFAULT_CLASS),
         "risk_level": req.get("risk_level", DEFAULT_RISK_LEVEL),
         "summary": req.get("summary", DEFAULT_SUMMARY),

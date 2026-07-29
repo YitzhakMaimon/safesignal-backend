@@ -364,9 +364,12 @@ def routing_by_risk_level_node(state: AgentState) -> dict:
 
 
 def route_by_risk_level(state: AgentState) -> str:
-    return {"high": "immediate_alert", "medium": "human_review", "low": "log_and_close"}.get(
-        state.risk_level, "human_review"
-    )
+    # "low" no longer auto-closes -- every incident that reaches this point gets a
+    # human set of eyes on it. risk_level itself still gets computed/stored/shown
+    # as "low" so the reviewer sees the system's own priority signal; only the
+    # auto-close routing is gone. log_and_close_node/the "low" graph edge are kept
+    # in place but now unreachable, in case this is ever reversed.
+    return {"high": "immediate_alert", "medium": "human_review"}.get(state.risk_level, "human_review")
 
 
 # =============================================================================
