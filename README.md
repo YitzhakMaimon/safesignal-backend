@@ -9,6 +9,11 @@ decides whether it needs an immediate alert, a human review, or can be
 logged and closed — with guardrails and hallucination checking on every
 AI-generated output before it reaches a human.
 
+This repo is the backend: the ingestion/screening/classification/decision
+pipeline and its microservices. The operator-facing UI that consumes it
+lives in a separate repo,
+[safesignal-dashboard](https://github.com/YitzhakMaimon/safesignal-dashboard).
+
 ## How it works
 
 ```
@@ -187,9 +192,9 @@ development machine.
 1. **Clone this repo, and the dashboard repo alongside it** (as sibling
    directories — the dashboard instructions below assume that layout):
    ```bash
-   git clone <this-repo> final_project_safesignal
-   git clone <dashboard-repo> safesignal-dashboard
-   cd final_project_safesignal
+   git clone https://github.com/YitzhakMaimon/safesignal-backend.git
+   git clone https://github.com/YitzhakMaimon/safesignal-dashboard.git
+   cd safesignal-backend
    python -m venv .venv
    ./.venv/Scripts/python.exe -m pip install -r requirements.txt
    ```
