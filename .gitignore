@@ -1,26 +1,35 @@
 __pycache__/
 *.pyc
 
-# סביבת venv מקומית של הפרויקט + קובץ הסודות עם המפתחות עצמם (ANTHROPIC_API_KEY,
-# GOOGLE_API_KEY וכו') - לעולם לא נכנסים ל-git. .env.example כן נשאר ב-git כתבנית.
+# Local project venv + the secrets file with the actual keys (ANTHROPIC_API_KEY,
+# GOOGLE_API_KEY, etc.) -- never committed. .env.example stays in git as the template.
 .venv/
 .env
 
-# נתונים שנוצרים בזמן ריצה - מכילים PII (שם/כתובת/גיל) של פונים
+# Runtime-generated data -- contains PII (name/address/age) of real reporters
 data/
 
-# תוצר בנייה נגזר (FAISS index + docstore) - נבנה מחדש אוטומטית מ-
-# training/distress_dataset_final.txt אם חסר/לא מעודכן, אין צורך ב-git
+# Derived build artifact (FAISS index + docstore) -- rebuilt automatically from
+# training/distress_dataset_final.txt if missing/stale, no need to track it
 training/faiss_index/
 services/rag_service/training/faiss_index/
 
-# מודל HeBERT מאומן (~418MB, בעיקר model.safetensors) - הורדה/חילוץ מ-
-# hebert_distress_model.zip שנוצר ב-training/train_hebert_colab.ipynb, לא קוד.
-# קובץ בגודל הזה נכשל בפוש ל-GitHub (מגבלת 100MB לקובץ) - משוחזר מהאימון מחדש.
+# Fine-tuned HeBERT model (~420 MB, mostly model.safetensors) -- downloaded/
+# extracted from hebert_distress_model.zip, produced by
+# training/train_hebert_colab.ipynb. Not source code, and this size fails a
+# normal GitHub push (100 MB per-file limit) -- reproducible by re-running
+# training, or download the pre-built weights (see README).
 hebert_distress_model/
 
 *.zip
 *.log
 
-# מפתח SSH פרטי ל-EC2 (safesignal-shared-key.pem) - לעולם לא נכנס ל-git.
+# Private SSH key for EC2 access -- never committed.
 *.pem
+
+# Personal, machine-specific ops scripts for an earlier EC2-tunnel-based
+# deployment (SSM/SSH tunnels, Windows Scheduled Tasks). Superseded by the
+# local docker-compose setup in the README -- kept locally for reference,
+# not relevant to running or reviewing this project.
+scripts/
+deploy_rag_service_ec2.sh

@@ -1,0 +1,41 @@
+# Root backend (safesignal.py) dependencies.
+# Each of the services/ microservices has its own requirements.txt for its
+# own Docker build -- this file is only for running the root FastAPI
+# backend + decision agent directly on the host (see README.md).
+
+fastapi==0.136.3
+uvicorn==0.41.0
+pydantic==2.13.4
+python-dotenv==1.2.2
+python-multipart==0.0.27
+websockets==15.0.1
+requests==2.34.2
+
+# Database (SQLite + async ORM) for the incidents/dashboard layer
+sqlalchemy==2.0.50
+aiosqlite==0.22.1
+
+# AWS (Bedrock, Comprehend, SES, S3) and other model providers
+boto3==1.42.62
+botocore==1.42.97
+anthropic==0.116.0
+groq==1.5.0
+twilio==9.10.9
+
+# Decision Agent (LangGraph + MCP tools)
+langgraph==1.2.9
+langchain-core==1.4.8
+langchain-aws==1.6.2
+langchain-community==0.4.2
+langchain-google-genai==4.2.7
+langchain-mcp-adapters==0.3.0
+mcp==1.27.2
+
+# HeBERT distress classifier + RAG retrieval
+torch==2.12.1
+transformers==5.5.4
+faiss-cpu==1.14.3
+numpy==2.5.0
+
+# Excel incident log export
+openpyxl==3.1.5
